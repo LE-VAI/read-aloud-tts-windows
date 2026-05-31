@@ -1,0 +1,40 @@
+# Local configuration
+config.json
+local-config.json
+
+# Downloaded voices and model artifacts
+voices/
+*.onnx
+*.onnx.json
+
+# Generated audio and runtime files
+*.wav
+*.log
+logs/
+temp/
+tmp/
+selection.txt
+speak.pid
+
+# Python environments and caches
+.venv/
+venv/
+__pycache__/
+*.py[cod]
+.pytest_cache/
+.mypy_cache/
+
+# Build output
+dist/
+build/
+
+# Editor and OS metadata
+.vscode/
+.idea/
+.DS_Store
+Thumbs.db
+
+# Backup and temporary files
+*.bak
+*.tmp
+*.partial

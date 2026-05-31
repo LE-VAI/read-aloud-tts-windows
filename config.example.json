@@ -1,0 +1,28 @@
+{
+  "current_voice": "en_US-lessac-medium",
+  "max_chars": 30000,
+  "chunk_chars": 900,
+  "voices": {
+    "en_US-lessac-medium": {
+      "label": "Lessac - warm",
+      "model": "voices/en_US-lessac-medium.onnx",
+      "config": "voices/en_US-lessac-medium.onnx.json",
+      "model_card": "https://huggingface.co/rhasspy/piper-voices/blob/main/en/en_US/lessac/medium/MODEL_CARD",
+      "license_note": "Review the Lessac model card and linked dataset license before use."
+    },
+    "en_US-amy-medium": {
+      "label": "Amy - clear",
+      "model": "voices/en_US-amy-medium.onnx",
+      "config": "voices/en_US-amy-medium.onnx.json",
+      "model_card": "https://huggingface.co/rhasspy/piper-voices/blob/main/en/en_US/amy/medium/MODEL_CARD",
+      "license_note": "Review the Amy model card and linked voice source before use."
+    },
+    "en_US-hfc_female-medium": {
+      "label": "HFC Female - soft",
+      "model": "voices/en_US-hfc_female-medium.onnx",
+      "config": "voices/en_US-hfc_female-medium.onnx.json",
+      "model_card": "https://huggingface.co/rhasspy/piper-voices/blob/main/en/en_US/hfc_female/medium/MODEL_CARD",
+      "license_note": "Sensitive: the hfc_female model card references CC BY-NC-SA 4.0 dataset licensing."
+    }
+  }
+}

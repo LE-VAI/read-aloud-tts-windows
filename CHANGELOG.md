@@ -1,0 +1,9 @@
+# Changelog
+
+## 0.1.0 - Public source candidate
+
+- Prepared source-only Windows ReadAloudTTS public candidate.
+- Added AutoHotkey v2 tray and hotkey helper.
+- Added Python Piper TTS runner with text chunking and temporary WAV cleanup.
+- Added installer, uninstaller, voice downloader, documentation, and sanitization checks.
+- Excluded voice models, logs, temp files, virtual environments, and local config from source control.
