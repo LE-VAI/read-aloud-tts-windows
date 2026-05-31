@@ -3,6 +3,7 @@ import ctypes
 import json
 import logging
 import re
+import shutil
 import subprocess
 import sys
 import tempfile
@@ -71,6 +72,26 @@ def find_piper_command() -> list[str]:
         if candidate.exists():
             return [str(candidate)]
     return [sys.executable, "-m", "piper"]
+
+
+def cleanup_stale_temp_audio(current_run_dir: Path | None = None) -> None:
+    TMP_DIR.mkdir(parents=True, exist_ok=True)
+    current_run_dir = current_run_dir.resolve() if current_run_dir else None
+
+    for temp_dir in TMP_DIR.glob("readaloud-*"):
+        try:
+            if current_run_dir and temp_dir.resolve() == current_run_dir:
+                continue
+            if temp_dir.is_dir():
+                shutil.rmtree(temp_dir, ignore_errors=True)
+        except OSError:
+            logging.warning("Could not remove stale temp folder: %s", temp_dir)
+
+    for loose_wav in TMP_DIR.glob("*.wav"):
+        try:
+            loose_wav.unlink(missing_ok=True)
+        except OSError:
+            logging.warning("Could not remove stale temp audio: %s", loose_wav)
 
 
 def normalize_text(text: str, max_chars: int) -> str:
@@ -164,15 +185,25 @@ def speak_text(text: str) -> None:
 
     chunks = chunk_text(text, chunk_chars)
     piper_command = find_piper_command()
-    TMP_DIR.mkdir(parents=True, exist_ok=True)
+    cleanup_stale_temp_audio()
 
     logging.info("Speaking %s chars using %s in %s chunks", len(text), voice_id, len(chunks))
-    with tempfile.TemporaryDirectory(prefix="readaloud-", dir=TMP_DIR) as temp_dir:
-        temp_root = Path(temp_dir)
+    temp_root = Path(tempfile.mkdtemp(prefix="readaloud-", dir=TMP_DIR)).resolve()
+    generated_wavs: list[Path] = []
+    try:
+        cleanup_stale_temp_audio(current_run_dir=temp_root)
         for index, chunk in enumerate(chunks, start=1):
             wav_path = temp_root / f"chunk-{index:04d}.wav"
             synthesize_chunk(piper_command, model, voice_config, chunk, wav_path)
+            generated_wavs.append(wav_path)
             winsound.PlaySound(str(wav_path), winsound.SND_FILENAME)
+    finally:
+        for wav_path in generated_wavs:
+            try:
+                wav_path.unlink(missing_ok=True)
+            except OSError:
+                logging.warning("Could not remove temp audio: %s", wav_path)
+        shutil.rmtree(temp_root, ignore_errors=True)
 
 
 def read_text_arg(args: argparse.Namespace) -> str:

@@ -1,5 +1,11 @@
 # Changelog
 
+## 0.1.1 - Temp audio cleanup patch
+
+- Added startup cleanup for stale `tmp/readaloud-*` folders and loose temp WAV files.
+- Kept playback limited to WAV files generated during the current speech request.
+- Added explicit current-run temp audio cleanup after playback and failure.
+
 ## 0.1.0 - Public source candidate
 
 - Prepared source-only Windows ReadAloudTTS public candidate.
