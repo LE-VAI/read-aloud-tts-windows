@@ -7,7 +7,6 @@ SetWorkingDir A_ScriptDir
 global AppDir := A_ScriptDir
 global ConfigPath := AppDir . "\config.json"
 global TempDir := AppDir . "\tmp"
-global TextPath := TempDir . "\selection.txt"
 global PidPath := TempDir . "\speak.pid"
 global PyExe := AppDir . "\.venv\Scripts\python.exe"
 global Q := Chr(34)
@@ -16,6 +15,7 @@ DirCreate TempDir
 InitTray()
 
 ^RButton::ReadSelection()
+^RButton Up::SuppressCtrlRightClick()
 ^!Space::StopSpeech()
 
 InitTray() {
@@ -97,8 +97,12 @@ SetVoice(voiceId, *) {
     }
 }
 
+SuppressCtrlRightClick(*) {
+    return
+}
+
 ReadSelection(*) {
-    global TextPath, PyExe, AppDir, PidPath, TempDir, Q
+    global PyExe, AppDir, PidPath, TempDir, Q
 
     if !FileExist(PyExe) {
         TrayTip "Python environment missing. Run install.ps1.", "ReadAloudTTS"
@@ -107,16 +111,17 @@ ReadSelection(*) {
 
     savedClipboard := ClipboardAll()
     A_Clipboard := ""
+    Sleep 40
     Send "^c"
 
-    if !ClipWait(0.8) {
-        A_Clipboard := savedClipboard
+    if !ClipWait(1.2) {
+        RestoreClipboard(savedClipboard)
         TrayTip "No selected text found.", "ReadAloudTTS"
         return
     }
 
     text := A_Clipboard
-    A_Clipboard := savedClipboard
+    RestoreClipboard(savedClipboard)
     text := Trim(text)
 
     if (text = "") {
@@ -126,14 +131,23 @@ ReadSelection(*) {
 
     StopSpeech()
     DirCreate TempDir
-    try FileDelete TextPath
-    FileAppend text, TextPath, "UTF-8"
+    inputPath := TempDir . "\selection-" . A_TickCount . "-" . Random(100000, 999999) . ".txt"
+    FileAppend text, inputPath, "UTF-8-RAW"
 
-    cmd := Q . PyExe . Q . " " . Q . AppDir . "\speak.py" . Q . " --input-file " . Q . TextPath . Q . " --delete-input-file"
+    TrayTip "Reading selected text...", "ReadAloudTTS"
+    cmd := Q . PyExe . Q . " " . Q . AppDir . "\speak.py" . Q . " --input-file " . Q . inputPath . Q . " --delete-input-file"
     Run(cmd, AppDir, "Hide", &pid)
     try FileDelete PidPath
     FileAppend pid, PidPath, "UTF-8"
-    TrayTip "Speaking selection...", "ReadAloudTTS"
+    SetTimer DismissContextMenu, -150
+}
+
+RestoreClipboard(savedClipboard) {
+    try A_Clipboard := savedClipboard
+}
+
+DismissContextMenu() {
+    Send "{Ctrl Up}{Esc}"
 }
 
 StopSpeech(*) {

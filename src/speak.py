@@ -8,6 +8,7 @@ import subprocess
 import sys
 import tempfile
 import textwrap
+import unicodedata
 import winsound
 from pathlib import Path
 from typing import Any
@@ -17,6 +18,19 @@ APP_DIR = Path(__file__).resolve().parent
 CONFIG_PATH = APP_DIR / "config.json"
 LOG_PATH = APP_DIR / "logs" / "readaloud.log"
 TMP_DIR = APP_DIR / "tmp"
+PIPER_TIMEOUT_SECONDS = 90
+UNICODE_REPLACEMENTS = str.maketrans(
+    {
+        "\u2018": "'",
+        "\u2019": "'",
+        "\u201c": '"',
+        "\u201d": '"',
+        "\u2013": "-",
+        "\u2014": "-",
+        "\u2026": "...",
+        "\u00a0": " ",
+    }
+)
 
 
 def setup_logging() -> None:
@@ -95,6 +109,7 @@ def cleanup_stale_temp_audio(current_run_dir: Path | None = None) -> None:
 
 
 def normalize_text(text: str, max_chars: int) -> str:
+    text = sanitize_text(text)
     text = text.replace("\r\n", "\n").replace("\r", "\n")
     text = re.sub(r"[ \t]+", " ", text)
     text = re.sub(r"\n{3,}", "\n\n", text)
@@ -102,6 +117,33 @@ def normalize_text(text: str, max_chars: int) -> str:
     if len(text) > max_chars:
         text = text[:max_chars].rstrip() + "..."
     return text
+
+
+def sanitize_text(text: str) -> str:
+    text = text.encode("utf-8", errors="replace").decode("utf-8", errors="replace")
+    text = text.translate(UNICODE_REPLACEMENTS)
+    text = text.replace("\ufeff", "")
+
+    cleaned: list[str] = []
+    for char in text:
+        codepoint = ord(char)
+        if 0xD800 <= codepoint <= 0xDFFF:
+            cleaned.append("\ufffd")
+            continue
+
+        category = unicodedata.category(char)
+        if char in ("\n", "\t"):
+            cleaned.append(char)
+        elif category == "Cc":
+            cleaned.append(" ")
+        elif category == "Cf":
+            continue
+        elif category.startswith("S"):
+            cleaned.append(" ")
+        else:
+            cleaned.append(char)
+
+    return "".join(cleaned)
 
 
 def chunk_text(text: str, chunk_chars: int) -> list[str]:
@@ -161,6 +203,7 @@ def synthesize_chunk(
         stderr=subprocess.PIPE,
         check=True,
         creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0),
+        timeout=PIPER_TIMEOUT_SECONDS,
     )
 
 
@@ -212,7 +255,7 @@ def read_text_arg(args: argparse.Namespace) -> str:
     if args.input_file:
         input_path = Path(args.input_file)
         try:
-            return input_path.read_text(encoding="utf-8")
+            return input_path.read_text(encoding="utf-8-sig", errors="replace")
         finally:
             if args.delete_input_file:
                 input_path.unlink(missing_ok=True)
