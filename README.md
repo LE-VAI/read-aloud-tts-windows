@@ -1,8 +1,22 @@
 # ReadAloudTTS for Windows
 
-Offline Windows selected-text read-aloud helper using AutoHotkey and Piper TTS.
+![ReadAloudTTS hero](docs/assets/readme-hero.png)
 
-ReadAloudTTS lets you select text in an app, press `Ctrl + Right-click`, and hear the selected text spoken locally with Piper. It is meant to be a small Windows utility, not a browser extension and not a cloud reader.
+Offline Windows selected-text read-aloud helper using AutoHotkey and Piper TTS. Built for local utility: select text, press `Ctrl + Right-click`, and hear it spoken without sending the text to a cloud service.
+
+ReadAloudTTS is source-only, privacy-first, and designed to stay out of the way. It is not a browser extension and not a cloud reader.
+
+![ReadAloudTTS feature strip](docs/assets/feature-strip.png)
+
+## Highlights
+
+| Capability | Detail |
+| --- | --- |
+| Offline speech | Uses locally installed Piper after voice download. |
+| Fast capture | `Ctrl + Right-click` reads selected text anywhere normal copy works. |
+| Clipboard care | Temporarily copies selection, then restores the previous clipboard contents. |
+| Stop control | `Ctrl + Alt + Space` stops active speech. |
+| Source-only | No bundled voice models, logs, generated WAVs, or binaries. |
 
 ## What it does
 
@@ -91,6 +105,17 @@ Windows apps implement context menus differently. Injecting a custom item into e
 - Do not commit `config.json`, downloaded voices, generated WAV files, logs, temp files, or virtual environments.
 - Run the sanitization check before any commit or publication.
 - This repository is source-only and does not bundle AutoHotkey, Piper binaries, or Piper voice models.
+
+## Repo visuals
+
+Visual assets live in `docs/assets/`:
+
+- `readme-hero.png`
+- `social-preview.png`
+- `logo-mark.png`
+- `feature-strip.png`
+
+The GitHub social preview image is `docs/assets/social-preview.png`.
 
 ## Voice licensing
 
