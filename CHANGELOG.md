@@ -1,5 +1,19 @@
 # Changelog
 
+## 0.4.0 - Word highlighting overlay
+
+### Added
+- Always-on-top translucent overlay that shows the text being read with the current word highlighted in real time. The overlay appears at the bottom-center of the screen and follows along as the daemon speaks.
+- The daemon now writes a `highlight_state.json` file with per-word timings (approximate — distributed by character count across audio duration) at 30ms intervals during playback. The AHK overlay polls this file and moves the Edit selection to match the spoken word.
+- Word timings include `[word, start_ms, end_ms]` for each token, plus the full text and total playback duration, so the overlay can pick up mid-playback without needing to catch a startup event.
+- Overlay auto-hides when speech finishes or is stopped (Ctrl+Alt+Space).
+
+### Changed
+- `_synthesize_to_wav_bytes` now returns `(wav_bytes, total_samples, sample_rate)` so word timings can be computed from actual audio duration.
+- `handle_speak` synthesizes all chunks up front (building word timings across the full text) before playing, then emits highlight state via a background timer thread.
+- `StopSpeech` in AHK now stops the highlight timer and hides the overlay.
+- `ExitFunc` cleans up the overlay on AHK exit.
+
 ## 0.3.0 - Model keep-alive daemon (near-instant first audio)
 
 ### Added

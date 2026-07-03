@@ -12,8 +12,16 @@ global DaemonPidPath := TempDir . "\daemon.pid"
 global DaemonReadyPath := TempDir . "\daemon_ready"
 global RequestPath := TempDir . "\request.json"
 global ResponsePath := TempDir . "\response.json"
+global HighlightPath := TempDir . "\highlight_state.json"
 global PyExe := AppDir . "\.venv\Scripts\python.exe"
 global Q := Chr(34)
+
+; Highlight overlay state
+global HighlightGui := ""
+global HighlightWords := []
+global HighlightTotalMs := 0
+global HighlightPlayStart := 0
+global HighlightTimer := ""
 
 DirCreate TempDir
 ; Clean up any stale daemon readiness marker from a previous run.
@@ -252,9 +260,12 @@ SpeakViaDaemon(text) {
     ; Escape the text for JSON.
     jsonText := JsonEscape(text)
     req := '{"action":"speak","text":"' . jsonText . '"}'
-    ; Clean up any stale response file.
+    ; Clean up any stale response and highlight files.
     try FileDelete ResponsePath
+    try FileDelete HighlightPath
     FileAppend req, RequestPath, "UTF-8"
+    ; Start the highlight overlay timer (polls highlight_state.json).
+    StartHighlightTimer()
     ; Wait for the response (up to 120s for long text).
     WaitResponse(120)
 }
@@ -302,6 +313,9 @@ DismissContextMenu() {
 
 StopSpeech(*) {
     global PidPath, RequestPath, ResponsePath
+    ; Stop the highlight overlay first.
+    StopHighlightTimer()
+    HideHighlightOverlay()
     ; If the daemon is running, send it a stop request.
     if IsDaemonReady() {
         try FileDelete ResponsePath
@@ -328,9 +342,235 @@ OpenLogs(*) {
     Run "explorer.exe " . Q . AppDir . "\logs" . Q
 }
 
+; ---------------------------------------------------------------------------
+; Word highlighting overlay
+; ---------------------------------------------------------------------------
+;
+; A minimal always-on-top borderless window that shows the text being read
+; with the current word selected (highlighted). The daemon writes
+; highlight_state.json with per-word timings; this timer polls it and
+; moves the Edit selection to match the spoken word.
+;
+; The overlay is intentionally small (bottom-center, ~40% screen width) so
+; it doesn't obscure the source text. Click it to dismiss; Ctrl+Alt+Space
+; to stop speech and hide it.
+
+StartHighlightTimer() {
+    global HighlightTimer
+    if HighlightTimer != "" {
+        SetTimer HighlightTimer, 0
+    }
+    HighlightTimer := HighlightTick
+    SetTimer HighlightTimer, 30
+}
+
+StopHighlightTimer() {
+    global HighlightTimer
+    if HighlightTimer != "" {
+        SetTimer HighlightTimer, 0
+        HighlightTimer := ""
+    }
+}
+
+HighlightTick() {
+    global HighlightPath
+    if !FileExist(HighlightPath) {
+        return
+    }
+    try {
+        raw := FileRead(HighlightPath, "UTF-8")
+    } catch {
+        return
+    }
+    raw := Trim(raw)
+    if (raw = "") {
+        return
+    }
+    ; Parse the single-line JSON state.
+    state := JsonGet(raw, "state")
+    if (state = "start") {
+        HighlightOnStart(raw)
+    } else if (state = "playing") {
+        HighlightOnPlaying(raw)
+    } else if (state = "done" or state = "stop") {
+        HighlightOnStop()
+    }
+}
+
+HighlightOnStart(raw) {
+    global HighlightWords, HighlightTotalMs, HighlightPlayStart
+    text := JsonGet(raw, "text")
+    totalMs := JsonGet(raw, "total_ms")
+    HighlightTotalMs := (totalMs != "") ? Round(totalMs) : 0
+    ; Parse words: [["word",start_ms,end_ms],...]
+    HighlightWords := ParseWordTimings(raw)
+    HighlightPlayStart := A_TickCount
+    ShowHighlightOverlay(text)
+}
+
+HighlightOnPlaying(raw) {
+    global HighlightWords, HighlightPlayStart, HighlightTotalMs, HighlightGui
+    ; On first "playing" state, initialize the overlay from the full payload.
+    if (HighlightGui = "") {
+        text := JsonGet(raw, "text")
+        totalMs := JsonGet(raw, "total_ms")
+        HighlightTotalMs := (totalMs != "") ? Round(totalMs) : 0
+        HighlightWords := ParseWordTimings(raw)
+        ShowHighlightOverlay(text)
+    }
+    msStr := JsonGet(raw, "ms")
+    if (msStr = "") {
+        return
+    }
+    elapsed := Round(msStr)
+    ; Find the word whose [start_ms, end_ms) contains elapsed.
+    idx := FindWordIndex(HighlightWords, elapsed)
+    if (idx >= 0) {
+        SelectOverlayWord(idx)
+    }
+}
+
+HighlightOnStop() {
+    StopHighlightTimer()
+    HideHighlightOverlay()
+}
+
+; --- Overlay GUI ---
+
+ShowHighlightOverlay(text) {
+    global HighlightGui
+    HideHighlightOverlay()
+    HighlightGui := Gui("+AlwaysOnTop -Caption +ToolWindow +E0x20")
+    HighlightGui.BackColor := "1a1a2e"
+    HighlightGui.SetFont("s12", "Segoe UI")
+    ; Translucent dark panel, ~50% of screen width, bottom-center.
+    screenWidth := A_ScreenWidth
+    panelWidth := Round(screenWidth * 0.5)
+    panelHeight := 80
+    panelX := Round((screenWidth - panelWidth) / 2)
+    panelY := A_ScreenHeight - panelHeight - 60
+    HighlightGui.MarginX := 16
+    HighlightGui.MarginY := 12
+    editCtrl := HighlightGui.Add("Edit", "w" . (panelWidth - 32) . " h" . (panelHeight - 24) . " -VScroll -E0x200 cWhite Background1a1a2e", text)
+    ; Make the window translucent (220/255 opacity).
+    HighlightGui.Show("x" . panelX . " y" . panelY . " w" . panelWidth . " h" . panelHeight . " NA")
+    SetTranslucent(HighlightGui.Hwnd, 220)
+}
+
+SelectOverlayWord(idx) {
+    global HighlightGui, HighlightWords
+    if HighlightGui = "" {
+        return
+    }
+    ; Calculate character offset of word idx in the full text.
+    ; We use the stored word start/end offsets computed at parse time.
+    wordInfo := HighlightWords[idx + 1]  ; AHK arrays are 1-based
+    if !IsObject(wordInfo) {
+        return
+    }
+    charStart := wordInfo[4]
+    charEnd := wordInfo[5]
+    if (charStart < 0 or charEnd < 0) {
+        return
+    }
+    ; Select the current word (highlight). EM_SETSEL = 0xB1.
+    ; Find the Edit control.
+    try {
+        ctrl := HighlightGui["Edit1"]
+        if IsObject(ctrl) {
+            SendMessage(0xB1, charStart, charEnd, ctrl)
+        }
+    } catch {
+        ; Fallback: use window handle.
+        SendMessage 0xB1, charStart, charEnd, "Edit1", "ahk_id " . HighlightGui.Hwnd
+    }
+}
+
+HideHighlightOverlay() {
+    global HighlightGui
+    if HighlightGui != "" {
+        try HighlightGui.Destroy()
+        HighlightGui := ""
+    }
+}
+
+; --- JSON helpers (minimal regex parsing, no external lib) ---
+
+JsonGet(json, key) {
+    pat := '"\s*' . key . '\s*"\s*:\s*'
+    if RegExMatch(json, pat . '(-?\d+\.?\d*)', &m) {
+        return m[1]
+    }
+    if RegExMatch(json, pat . '"([^"]*)"', &m) {
+        return m[1]
+    }
+    return ""
+}
+
+ParseWordTimings(json) {
+    ; Extract the "words" array and build per-word info with char offsets.
+    ; Each entry: ["word", start_ms, end_ms]. We also compute char offsets
+    ; by scanning the full text for each word sequentially.
+    global HighlightWords
+    result := []
+    text := JsonGet(json, "text")
+    pos := 1
+    ; Find each word tuple via regex.
+    pat := '\["([^"]+)",\s*([\d.]+),\s*([\d.]+)\]'
+    searchFrom := 1
+    charSearchPos := 1
+    while RegExMatch(json, pat, &m, searchFrom) {
+        word := m[1]
+        startMs := Round(m[2])
+        endMs := Round(m[3])
+        ; Find this word's char offset in the full text (sequential scan).
+        foundPos := InStr(text, word, false, charSearchPos)
+        if (foundPos > 0) {
+            charStart := foundPos - 1  ; 0-based for EM_SETSEL
+            charEnd := foundPos + StrLen(word) - 1
+            result.Push([word, startMs, endMs, charStart, charEnd])
+            charSearchPos := foundPos + StrLen(word)
+        } else {
+            ; Fallback: append with unknown offset.
+            result.Push([word, startMs, endMs, -1, -1])
+        }
+        searchFrom := m.Pos + m.Len
+    }
+    return result
+}
+
+FindWordIndex(words, elapsedMs) {
+    ; words is 1-based AHK array of [word, startMs, endMs, charStart, charEnd].
+    ; Return 0-based index of the word whose [startMs, endMs) contains elapsedMs.
+    if (words.Length = 0) {
+        return -1
+    }
+    i := 1
+    while (i <= words.Length) {
+        w := words[i]
+        if (elapsedMs >= w[2] and elapsedMs < w[3]) {
+            return i - 1
+        }
+        i++
+    }
+    ; If past the last word, return last index.
+    return words.Length - 1
+}
+
+SetTranslucent(hwnd, opacity) {
+    ; opacity: 0-255. 255 = fully opaque.
+    if (hwnd) {
+        exStyle := DllCall("GetWindowLong", "Ptr", hwnd, "Int", -20, "Ptr")
+        DllCall("SetWindowLong", "Ptr", hwnd, "Int", -20, "Ptr", exStyle | 0x80000)
+        DllCall("SetLayeredWindowAttributes", "Ptr", hwnd, "UInt", 0, "UChar", opacity, "UInt", 0x02)
+    }
+}
+
 OnExit(ExitFunc)
 
 ExitFunc(*) {
+    StopHighlightTimer()
+    HideHighlightOverlay()
     StopDaemon()
     ExitApp
 }
