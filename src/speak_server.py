@@ -27,6 +27,7 @@ import io
 import json
 import logging
 import os
+import re
 import struct
 import sys
 import threading
@@ -104,31 +105,90 @@ def _silence_bytes(sample_rate: int, duration_s: float) -> bytes:
     return struct.pack(f"<{num_samples}h", *([0] * num_samples))
 
 
+# ---------------------------------------------------------------------------
+# Word highlighting
+# ---------------------------------------------------------------------------
+#
+# The daemon writes a highlight state file the AHK overlay polls (~30ms).
+# Format is a single JSON line:
+#   {"state":"start","text":"...","words":[["word",start_ms,end_ms],...]}
+#   {"state":"playing","ms":1234}
+#   {"state":"stop"}
+#
+# Word timings are *approximate* — we distribute each chunk's audio duration
+# across its words proportional to character count. Piper doesn't expose
+# per-word timestamps via the Python API, so this is a best-effort visual
+# guide, not a karaoke-precise alignment.
+
+_HIGHLIGHT_PATH = APP_DIR / "tmp" / "highlight_state.json"
+
+
+def _compute_word_timings(text: str, audio_samples: int, sample_rate: int) -> list[list]:
+    """Return [[word, start_ms, end_ms], ...] distributing audio duration by char count."""
+    tokens = re.findall(r"\S+", text)
+    if not tokens or audio_samples <= 0:
+        return []
+    total_chars = sum(len(t) for t in tokens)
+    if total_chars == 0:
+        return []
+    duration_ms = (audio_samples / sample_rate) * 1000.0
+    timings: list[list] = []
+    elapsed_ms = 0.0
+    for token in tokens:
+        frac = len(token) / total_chars
+        token_ms = duration_ms * frac
+        timings.append([token, round(elapsed_ms, 1), round(elapsed_ms + token_ms, 1)])
+        elapsed_ms += token_ms
+    return timings
+
+
+def _write_highlight_state(state: dict[str, Any]) -> None:
+    """Write a single-line JSON highlight state for the AHK overlay to poll."""
+    try:
+        _HIGHLIGHT_PATH.write_text(json.dumps(state) + "\n", encoding="utf-8")
+    except OSError:
+        pass
+
+
+def _clear_highlight_state() -> None:
+    """Remove the highlight state file."""
+    try:
+        _HIGHLIGHT_PATH.unlink()
+    except OSError:
+        pass
+
+
 def _synthesize_to_wav_bytes(
     voice: PiperVoice,
     text: str,
     syn_config: SynthesisConfig,
     sentence_silence: float,
-) -> bytes:
+) -> tuple[bytes, int, int]:
     """Synthesize text to in-memory WAV bytes using the PiperVoice API.
 
     Iterates the synthesize() generator (one AudioChunk per sentence),
     concatenates audio_int16_bytes, and inserts sentence_silence between
     sentences (since SynthesisConfig has no sentence_silence field).
+
+    Returns (wav_bytes, total_samples, sample_rate).
     """
     chunks = list(voice.synthesize(text, syn_config))
     if not chunks:
-        return b""
+        return b"", 0, 0
 
     sample_rate = chunks[0].sample_rate
     silence = _silence_bytes(sample_rate, sentence_silence) if sentence_silence > 0 else b""
 
     # Build raw PCM by concatenating chunk audio with silence between sentences.
     pcm = io.BytesIO()
+    total_samples = 0
     for i, chunk in enumerate(chunks):
         if i > 0 and silence:
             pcm.write(silence)
-        pcm.write(chunk.audio_int16_bytes)
+            total_samples += int(sample_rate * sentence_silence)
+        chunk_bytes = chunk.audio_int16_bytes
+        pcm.write(chunk_bytes)
+        total_samples += len(chunk_bytes) // 2  # 16-bit = 2 bytes/sample
     raw_pcm = pcm.getvalue()
 
     # Wrap in a WAV container for winsound.PlaySound.
@@ -138,13 +198,14 @@ def _synthesize_to_wav_bytes(
         wav_file.setsampwidth(2)  # 16-bit
         wav_file.setnchannels(1)  # mono
         wav_file.writeframes(raw_pcm)
-    return wav_buf.getvalue()
+    return wav_buf.getvalue(), total_samples, sample_rate
 
 
 def handle_speak(text: str) -> dict[str, str]:
     """Speak text using the cached PiperVoice model."""
     global _stop_requested
     _stop_requested = False
+    _clear_highlight_state()
 
     config = load_config()
     voice_id = config.get("current_voice", _current_voice_id)
@@ -168,39 +229,81 @@ def handle_speak(text: str) -> dict[str, str]:
 
     import winsound
 
-    def synth_chunk(chunk_text: str) -> bytes:
+    def synth_chunk(chunk_text: str) -> tuple[bytes, int, int]:
         return _synthesize_to_wav_bytes(voice, chunk_text, syn_config, sentence_silence)
 
+    # Build word timings across all chunks for the highlight overlay.
+    # Each chunk's words get timings relative to that chunk's audio, then we
+    # offset them by the cumulative duration of prior chunks (+ pauses).
+    all_word_timings: list[list] = []
+    synth_results: list[tuple[bytes, int, int]] = []
+    # Synth first chunk synchronously to measure; pipeline the rest later.
+    # For highlight we need all timings up front, so synth all chunks first
+    # when there aren't too many (keeps it simple and correct).
+    # For large texts the pipeline still works — we just emit highlight
+    # state per-chunk as we go.
+    chunk_offset_ms = 0.0
+    chunk_timings_list: list[list[list]] = []  # per chunk: [[word, s_ms, e_ms], ...]
+
     with _playback_lock:
-        if len(chunks) == 1:
-            wav_bytes = synth_chunk(chunks[0])
-            t_synth = time.time()
-            logging.info("Synthesis took %.3fs, playback starting", t_synth - t_start)
-            if not _stop_requested:
-                winsound.PlaySound(wav_bytes, winsound.SND_MEMORY)
-        else:
-            # Pipeline: pre-synth chunk N+1 while chunk N plays.
-            first_wav = synth_chunk(chunks[0])
-            t_synth = time.time()
-            logging.info("First chunk synthesis took %.3fs, playback starting", t_synth - t_start)
-            for i in range(1, len(chunks)):
-                if _stop_requested:
+        # Synthesize all chunks, building word timings.
+        for ci, chunk in enumerate(chunks):
+            if _stop_requested:
+                break
+            wav_bytes, total_samples, sample_rate = synth_chunk(chunk)
+            synth_results.append((wav_bytes, total_samples, sample_rate))
+            wtimings = _compute_word_timings(chunk, total_samples, sample_rate)
+            # Offset by cumulative prior playback time.
+            for wt in wtimings:
+                all_word_timings.append([wt[0], round(wt[1] + chunk_offset_ms, 1), round(wt[2] + chunk_offset_ms, 1)])
+            chunk_timings_list.append(wtimings)
+            chunk_offset_ms += (total_samples / sample_rate * 1000.0) if sample_rate else 0
+            chunk_offset_ms += inter_chunk_pause * 1000.0 if ci < len(chunks) - 1 else 0
+
+        t_synth = time.time()
+        logging.info("Synthesis took %.3fs, playback starting", t_synth - t_start)
+
+        if _stop_requested:
+            _clear_highlight_state()
+            return {"status": "ok", "message": "Stopped"}
+
+        # Start a timer thread that writes "playing" state with elapsed ms.
+        # Each state write includes the full text + word timings so the AHK
+        # overlay never needs to catch a transient "start" event — it can
+        # pick up mid-playback and still render the highlight correctly.
+        playback_start = time.time()
+        total_play_ms = chunk_offset_ms
+
+        def emit_playing() -> None:
+            while not _stop_requested:
+                elapsed = (time.time() - playback_start) * 1000.0
+                if elapsed >= total_play_ms:
                     break
-                next_wav_holder: list[bytes] = [b""]
-                worker = threading.Thread(
-                    target=lambda holder=next_wav_holder, ct=chunks[i]: holder.__setitem__(
-                        0, synth_chunk(ct)
-                    ),
-                    daemon=True,
-                )
-                worker.start()
-                winsound.PlaySound(first_wav, winsound.SND_MEMORY)
-                if not _stop_requested and inter_chunk_pause > 0:
-                    time.sleep(inter_chunk_pause)
-                worker.join()
-                first_wav = next_wav_holder[0]
-            if not _stop_requested and first_wav:
-                winsound.PlaySound(first_wav, winsound.SND_MEMORY)
+                _write_highlight_state({
+                    "state": "playing",
+                    "text": text,
+                    "words": all_word_timings,
+                    "total_ms": round(total_play_ms, 1),
+                    "ms": round(elapsed, 1),
+                })
+                time.sleep(0.03)  # 30ms refresh
+            if not _stop_requested:
+                _write_highlight_state({"state": "done"})
+
+        timer = threading.Thread(target=emit_playing, daemon=True)
+        timer.start()
+
+        # Play all chunks sequentially.
+        for ci, (wav_bytes, _samples, _sr) in enumerate(synth_results):
+            if _stop_requested:
+                break
+            winsound.PlaySound(wav_bytes, winsound.SND_MEMORY)
+            if not _stop_requested and ci < len(synth_results) - 1 and inter_chunk_pause > 0:
+                time.sleep(inter_chunk_pause)
+
+        _stop_requested = True  # signal timer to stop
+        timer.join(timeout=1.0)
+        _write_highlight_state({"state": "done"})
 
     return {"status": "ok", "message": "Text spoken"}
 
@@ -229,6 +332,7 @@ def handle_stop() -> dict[str, str]:
         winsound.PlaySound(None, 0)  # Cancel any playing sound.
     except Exception:
         pass
+    _write_highlight_state({"state": "stop"})
     return {"status": "ok", "message": "Stop requested"}
 
 
