@@ -16,6 +16,8 @@ ReadAloudTTS is source-only, privacy-first, and designed to stay out of the way.
 | Fast capture | `Ctrl + Right-click` reads selected text anywhere normal copy works. |
 | Clipboard care | Temporarily copies selection, then restores the previous clipboard contents. |
 | Stop control | `Ctrl + Alt + Space` stops active speech. |
+| Natural cadence | Configurable sentence pauses, inter-chunk gaps, and Piper prosody knobs. |
+| Pipelined playback | Chunk N+1 is synthesized while chunk N plays, minimizing gaps. |
 | Source-only | No bundled voice models, logs, generated WAVs, or binaries. |
 
 ## What it does
@@ -87,6 +89,21 @@ powershell -NoProfile -ExecutionPolicy Bypass -File .\uninstall.ps1 -RemoveAppDa
 2. Press `Ctrl + Right-click`.
 3. Press `Ctrl + Alt + Space` to stop speech.
 4. Use the tray menu to read, stop, change voice, open config, or open logs.
+
+## Tuning speech cadence
+
+After install, `config.json` (in the app folder, copied from `config.example.json`) includes optional keys that control how Piper speaks. Edit the file and restart the helper for changes to take effect.
+
+| Key | Default | Effect |
+| --- | --- | --- |
+| `chunk_chars` | `2000` | Maximum characters per Piper invocation. Lower values = more chunks (more cold starts); higher = fewer chunks (faster). |
+| `sentence_silence` | `0.5` | Seconds of silence Piper inserts after each sentence. Increase for more breathing room; decrease for faster delivery. |
+| `inter_chunk_pause` | `0.3` | Seconds of silence between chunk playbacks. Prevents abrupt merges at chunk boundaries. |
+| `length_scale` | `1.0` | Overall speech speed. `1.0` = natural, `0.8` = slower/clearer, `1.2` = faster. |
+| `noise_scale` | `0.667` | Pitch/prosody variation. Higher = more expressive intonation; lower = flatter. |
+| `noise_w` | `0.8` | Phoneme duration jitter. Higher = more human-like rhythmic irregularity; lower = steadier cadence. |
+
+If a key is absent from `config.json`, the voice model's built-in defaults are used.
 
 ## Why Ctrl + Right-click
 
