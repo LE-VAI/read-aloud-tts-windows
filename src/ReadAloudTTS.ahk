@@ -181,7 +181,7 @@ GetCurrentVoice() {
 }
 
 SetVoice(voiceId, *) {
-    global Q, PyExe, AppDir
+    global Q, PyExe, AppDir, ResponsePath, RequestPath
     StopSpeech()
 
     if !FileExist(PyExe) {
@@ -262,7 +262,7 @@ ReadSelection(*) {
 }
 
 SpeakViaDaemon(text) {
-    global RequestPath, ResponsePath
+    global RequestPath, ResponsePath, HighlightPath
     ; Escape the text for JSON.
     jsonText := JsonEscape(text)
     req := '{"action":"speak","text":"' . jsonText . '"}'
