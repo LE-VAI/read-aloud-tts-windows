@@ -468,7 +468,10 @@ ShowHighlightOverlay(text) {
     global HighlightGui, HighlightFullText
     HideHighlightOverlay()
     HighlightFullText := text
-    HighlightGui := Gui("+AlwaysOnTop -Caption +ToolWindow +E0x20")
+    ; +E0x08000000 = WS_EX_NOACTIVATE: window doesn't steal focus when clicked.
+    ; Do NOT use +E0x20 (WS_EX_TRANSPARENT) — it makes the window invisible
+    ; to mouse events, which would break hover-pause and click-to-rewind.
+    HighlightGui := Gui("+AlwaysOnTop -Caption +ToolWindow +E0x08000000")
     HighlightGui.BackColor := "1a1a2e"
     HighlightGui.SetFont("s12", "Segoe UI")
     ; Translucent dark panel, ~50% of screen width, bottom-center.
@@ -479,7 +482,8 @@ ShowHighlightOverlay(text) {
     panelY := A_ScreenHeight - panelHeight - 60
     HighlightGui.MarginX := 16
     HighlightGui.MarginY := 12
-    editCtrl := HighlightGui.Add("Edit", "w" . (panelWidth - 32) . " h" . (panelHeight - 24) . " -VScroll -E0x200 cWhite Background1a1a2e", text)
+    ; -E0x200 removes WS_EX_TRANSPARENT from the Edit control too.
+    editCtrl := HighlightGui.Add("Edit", "w" . (panelWidth - 32) . " h" . (panelHeight - 24) . " -VScroll cWhite Background1a1a2e", text)
     ; Hover-pause: when mouse enters the overlay, pause speech.
     ; Mouse leaves: resume from current word.
     HighlightGui.OnEvent("MouseMove", OverlayHoverPause)
