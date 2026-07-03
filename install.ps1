@@ -77,6 +77,9 @@ if (-not (Test-Path -LiteralPath (Join-Path $srcDir "ReadAloudTTS.ahk"))) {
 if (-not (Test-Path -LiteralPath (Join-Path $srcDir "speak.py"))) {
     throw "Source file missing: src\speak.py"
 }
+if (-not (Test-Path -LiteralPath (Join-Path $srcDir "speak_server.py"))) {
+    throw "Source file missing: src\speak_server.py"
+}
 
 Write-Host "Installing ReadAloudTTS to $InstallDir"
 Stop-ExistingHelper
@@ -89,6 +92,7 @@ foreach ($folder in @("logs", "tmp", "voices")) {
 $copyMap = @(
     @{ Source = Join-Path $srcDir "ReadAloudTTS.ahk"; Target = Join-Path $InstallDir "ReadAloudTTS.ahk" },
     @{ Source = Join-Path $srcDir "speak.py"; Target = Join-Path $InstallDir "speak.py" },
+    @{ Source = Join-Path $srcDir "speak_server.py"; Target = Join-Path $InstallDir "speak_server.py" },
     @{ Source = Join-Path $sourceDir "download_voices.ps1"; Target = Join-Path $InstallDir "download_voices.ps1" },
     @{ Source = Join-Path $sourceDir "uninstall.ps1"; Target = Join-Path $InstallDir "uninstall.ps1" },
     @{ Source = Join-Path $sourceDir "config.example.json"; Target = Join-Path $InstallDir "config.example.json" }
