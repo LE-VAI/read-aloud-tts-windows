@@ -1,7 +1,12 @@
 {
   "current_voice": "en_US-lessac-medium",
   "max_chars": 30000,
-  "chunk_chars": 900,
+  "chunk_chars": 2000,
+  "sentence_silence": 0.5,
+  "inter_chunk_pause": 0.3,
+  "length_scale": 1.0,
+  "noise_scale": 0.667,
+  "noise_w": 0.8,
   "voices": {
     "en_US-lessac-medium": {
       "label": "Lessac - warm",

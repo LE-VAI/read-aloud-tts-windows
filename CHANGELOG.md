@@ -1,5 +1,20 @@
 # Changelog
 
+## 0.2.0 - Performance and cadence improvements
+
+### Performance
+- Pipelined synthesis and playback: chunk N+1 is synthesized in a background thread while chunk N plays, hiding all but the first Piper cold start behind audio time.
+- Merged short paragraphs into chunks up to the character budget instead of emitting one chunk per paragraph, cutting chunk count 3-5x for typical multi-paragraph selections.
+- Raised default `chunk_chars` from 900 to 2000, reducing the number of Piper process launches per request.
+- Switched Piper invocation to `sys.executable -m piper` to pin to the venv interpreter, eliminating a wrong-interpreter race from the standalone `piper.exe` zip-app launcher.
+
+### Cadence and naturalness
+- Added configurable `--sentence-silence` (default 0.5s) so Piper inserts a clean pause after every sentence instead of running sentences together.
+- Added an inter-chunk pause (default 0.3s) between WAV playbacks so chunk boundaries do not sound like an abrupt mid-sentence merger.
+- Preserved em-dashes as a spaced ` — ` so Piper reads them as a pause instead of a compound word.
+- Verbalized common symbols (`$` to "dollars", `%` to "percent", `&` to "and", `+` to "plus", `=` to "equals", `@` to "at", `#` to "hashtag") instead of silently deleting them, preventing the skipped-word effect.
+- Exposed prosody knobs in `config.json`: `sentence_silence`, `inter_chunk_pause`, `length_scale`, `noise_scale`, and `noise_w`.
+
 ## 0.1.2 - Interactive capture and Unicode hardening
 
 - Swallowed Ctrl+Right-click down/up in the AutoHotkey helper to avoid browser context menu leakage.
