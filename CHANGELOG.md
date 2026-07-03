@@ -1,5 +1,16 @@
 # Changelog
 
+## 0.6.0 - Transcript overlay
+
+### Added
+- **Transcript overlay** (Ctrl+Alt+T or tray menu "Show Transcript"): opens a separate, larger, scrollable, always-on-top window showing the full text being read. Uses the last-read text if available, otherwise falls back to the clipboard. Stays open until closed so the user can review what was read.
+- Resizable transcript window with a Close button and proper resize handling.
+- Transcript window is cleaned up on AHK exit.
+
+### Changed
+- `HighlightFullText` global is now populated during playback and reused by the transcript overlay.
+- `ExitFunc` closes the transcript window on exit.
+
 ## 0.5.0 - Hover-pause and click-to-rewind overlay
 
 ### Added

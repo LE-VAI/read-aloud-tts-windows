@@ -25,6 +25,7 @@ global HighlightTimer := ""
 global HighlightCurrentIdx := -1
 global HighlightPaused := false
 global HighlightFullText := ""
+global TranscriptGui := ""
 
 DirCreate TempDir
 ; Clean up any stale daemon readiness marker from a previous run.
@@ -36,6 +37,7 @@ InitTray()
 ^RButton::ReadSelection()
 ^RButton Up::SuppressCtrlRightClick()
 ^!Space::StopSpeech()
+^!t::ShowTranscript()
 
 StartDaemon()
 
@@ -122,6 +124,7 @@ InitTray() {
     A_TrayMenu.Add()
     A_TrayMenu.Add("Open Config", (*) => OpenConfig())
     A_TrayMenu.Add("Open Logs", (*) => OpenLogs())
+    A_TrayMenu.Add("Show Transcript`tCtrl+Alt+T", (*) => ShowTranscript())
     A_TrayMenu.Add("Restart Daemon", (*) => RestartDaemon())
     A_TrayMenu.Add("Exit", (*) => ExitApp())
     A_TrayMenu.Default := "Read Selection`tCtrl+Right-click"
@@ -617,6 +620,76 @@ HideHighlightOverlay() {
     HighlightCurrentIdx := -1
 }
 
+; ---------------------------------------------------------------------------
+; Transcript overlay
+; ---------------------------------------------------------------------------
+;
+; A separate, larger, scrollable window that shows the full text being read.
+; Opens via Ctrl+Alt+T or the tray menu. Stays open until closed so the user
+; can review what was read. If the highlight overlay is active, the transcript
+; syncs to show the same text.
+
+ShowTranscript(*) {
+    global TranscriptGui, HighlightFullText
+    ; Destroy any existing transcript window.
+    if TranscriptGui != "" {
+        try TranscriptGui.Destroy()
+        TranscriptGui := ""
+    }
+    ; Use the last-read text if available; otherwise prompt for clipboard.
+    text := HighlightFullText
+    if (text = "") {
+        savedClipboard := ClipboardAll()
+        A_Clipboard := ""
+        Sleep 40
+        Send "^c"
+        if ClipWait(1.0) {
+            text := A_Clipboard
+        }
+        try A_Clipboard := savedClipboard
+        text := Trim(text)
+    }
+    if (text = "") {
+        TrayTip "No text to show. Select text and read first, or copy text to clipboard.", "ReadAloudTTS"
+        return
+    }
+
+    TranscriptGui := Gui("+AlwaysOnTop +Resize +MinSize300x200", "ReadAloudTTS Transcript")
+    TranscriptGui.BackColor := "1a1a2e"
+    TranscriptGui.SetFont("s12", "Segoe UI")
+    ; Scrollable read-only Edit control.
+    TranscriptGui.MarginX := 12
+    TranscriptGui.MarginY := 12
+    editCtrl := TranscriptGui.Add("Edit", "w600 h400 +ReadOnly -VScroll +Wrap cWhite Background1a1a2e", text)
+    ; Close button.
+    TranscriptGui.Add("Button", "default w120 x260 h32", "Close").OnEvent("Click", (*) => CloseTranscript())
+    TranscriptGui.OnEvent("Close", (*) => CloseTranscript())
+    TranscriptGui.OnEvent("Size", TranscriptResize)
+    TranscriptGui.Show("AutoSize")
+}
+
+TranscriptResize(*) {
+    global TranscriptGui
+    if TranscriptGui = "" {
+        return
+    }
+    ; Resize the Edit control to fill the window.
+    try {
+        ctrl := TranscriptGui["Edit1"]
+        if IsObject(ctrl) {
+            ctrl.Move(, , TranscriptGui.ClientWidth - 24, TranscriptGui.ClientHeight - 60)
+        }
+    }
+}
+
+CloseTranscript(*) {
+    global TranscriptGui
+    if TranscriptGui != "" {
+        try TranscriptGui.Destroy()
+        TranscriptGui := ""
+    }
+}
+
 ; --- JSON helpers (minimal regex parsing, no external lib) ---
 
 JsonGet(json, key) {
@@ -694,6 +767,7 @@ OnExit(ExitFunc)
 ExitFunc(*) {
     StopHighlightTimer()
     HideHighlightOverlay()
+    CloseTranscript()
     StopDaemon()
     ExitApp
 }
