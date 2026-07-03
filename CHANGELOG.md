@@ -1,5 +1,20 @@
 # Changelog
 
+## 0.5.0 - Hover-pause and click-to-rewind overlay
+
+### Added
+- **Hover-pause**: Moving the mouse over the highlight overlay pauses speech. Moving the mouse away resumes from the current word. The daemon re-synthesizes from the current word position on resume.
+- **Click-to-rewind**: Click any word in the overlay to restart speech from that word. The overlay sends a `from_word` seek request to the daemon, which skips earlier words and re-synthesizes from the clicked position.
+- `from_word` parameter on the `speak` action in the daemon protocol — skips the first N words of the text before synthesizing.
+- `SeekFromWord` AHK function that sends a seek request with the original full text + word index.
+- Mouse-leave detection in the highlight timer — checks if the cursor has left the overlay window and triggers resume.
+
+### Changed
+- `handle_speak` now accepts an optional `from_word` parameter that truncates the text before chunking/synthesis.
+- `HighlightOnPlaying` tracks `HighlightCurrentIdx` so resume knows which word to restart from.
+- `HighlightTick` checks mouse position over the overlay to detect hover-pause/resume transitions.
+- `HideHighlightOverlay` resets `HighlightPaused` and `HighlightCurrentIdx`.
+
 ## 0.4.0 - Word highlighting overlay
 
 ### Added
