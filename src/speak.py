@@ -367,10 +367,20 @@ def main() -> int:
     parser.add_argument("--set-voice")
     parser.add_argument("--list-voices", action="store_true")
     parser.add_argument("--delete-input-file", action="store_true")
+    parser.add_argument(
+        "--serve",
+        action="store_true",
+        help="Run as a long-lived TTS daemon (stdin JSON-line protocol). "
+        "Loads the Piper model once and serves speak requests without "
+        "re-launching the process, eliminating the model-load cold start.",
+    )
     args = parser.parse_args()
 
     setup_logging()
     try:
+        if args.serve:
+            from speak_server import serve
+            return serve()
         if args.set_voice:
             set_voice(args.set_voice)
             return 0

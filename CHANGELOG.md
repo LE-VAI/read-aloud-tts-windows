@@ -1,5 +1,21 @@
 # Changelog
 
+## 0.3.0 - Model keep-alive daemon (near-instant first audio)
+
+### Added
+- Long-lived Piper model daemon (`speak_server.py`) that loads the ONNX voice model once on startup and serves subsequent speak requests from memory, eliminating the ~2s model-load cold start on every Ctrl+Right-click. Synthesis drops from ~1.9s (full cold start) to ~150-500ms (inference only) after the first load.
+- `--serve` flag on `speak.py` to launch the daemon mode.
+- File-based request/response protocol (`tmp/request.json` / `tmp/response.json`) between AutoHotkey and the daemon — no named pipes, no extra dependencies.
+- Automatic daemon startup when the AHK tray launches (model pre-warms at Windows login via the startup shortcut).
+- Graceful fallback: if the daemon is unavailable, the AHK automatically uses the original `speak.py --input-file` cold-start path with no regression.
+- "Restart Daemon" tray menu item.
+- Clean shutdown: daemon quits on AHK exit via `OnExit`.
+
+### Changed
+- AutoHotkey hotkeys are now registered before `StartDaemon()` so the keyboard hook installs before the auto-execute section blocks on daemon warmup.
+- `speak_server.py` uses the `PiperVoice` Python API (`PiperVoice.load()` + `.synthesize()`) for in-memory synthesis with no subprocess and no temp WAV files — audio is played via `winsound.PlaySound` with `SND_MEMORY`.
+- Sentence silence is handled by inserting silence bytes between `AudioChunk` boundaries (the `SynthesisConfig` API has no sentence_silence field, unlike the Piper CLI).
+
 ## 0.2.0 - Performance and cadence improvements
 
 ### Performance
