@@ -201,8 +201,12 @@ def _synthesize_to_wav_bytes(
     return wav_buf.getvalue(), total_samples, sample_rate
 
 
-def handle_speak(text: str) -> dict[str, str]:
-    """Speak text using the cached PiperVoice model."""
+def handle_speak(text: str, from_word: int = 0) -> dict[str, str]:
+    """Speak text using the cached PiperVoice model.
+
+    If from_word > 0, skip the first N words (used for click-to-rewind:
+    the overlay sends the original text + the word index to restart from).
+    """
     global _stop_requested
     _stop_requested = False
     _clear_highlight_state()
@@ -218,6 +222,14 @@ def handle_speak(text: str) -> dict[str, str]:
     text = normalize_text(text, max_chars)
     if not text:
         return {"status": "error", "message": "No text to speak"}
+
+    # If from_word is set, skip the first N words (click-to-rewind).
+    if from_word > 0:
+        words = text.split()
+        if from_word >= len(words):
+            return {"status": "ok", "message": "Already at end"}
+        text = " ".join(words[from_word:])
+        logging.info("Seeking from word %s, remaining: %s chars", from_word, len(text))
 
     chunks = chunk_text(text, chunk_chars)
     syn_config = _build_syn_config(config)
@@ -389,7 +401,7 @@ def serve() -> int:
                     ready_path.unlink(missing_ok=True)
                     return 0
                 elif action == "speak":
-                    response = handle_speak(request.get("text", ""))
+                    response = handle_speak(request.get("text", ""), int(request.get("from_word", 0)))
                 elif action == "set_voice":
                     response = handle_set_voice(request.get("voice", ""))
                 elif action == "stop":

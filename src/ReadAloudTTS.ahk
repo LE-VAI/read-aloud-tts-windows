@@ -22,6 +22,9 @@ global HighlightWords := []
 global HighlightTotalMs := 0
 global HighlightPlayStart := 0
 global HighlightTimer := ""
+global HighlightCurrentIdx := -1
+global HighlightPaused := false
+global HighlightFullText := ""
 
 DirCreate TempDir
 ; Clean up any stale daemon readiness marker from a previous run.
@@ -373,7 +376,13 @@ StopHighlightTimer() {
 }
 
 HighlightTick() {
-    global HighlightPath
+    global HighlightPath, HighlightGui, HighlightPaused
+    ; Check mouse-leave resume (hover-pause: resume when mouse leaves overlay).
+    if (HighlightGui != "" and HighlightPaused) {
+        if !IsMouseOverOverlay() {
+            OverlayMouseLeaveResume()
+        }
+    }
     if !FileExist(HighlightPath) {
         return
     }
@@ -397,6 +406,15 @@ HighlightTick() {
     }
 }
 
+IsMouseOverOverlay() {
+    global HighlightGui
+    if (HighlightGui = "") {
+        return false
+    }
+    MouseGetPos &mouseX, &mouseY, &winHwnd
+    return (winHwnd = HighlightGui.Hwnd)
+}
+
 HighlightOnStart(raw) {
     global HighlightWords, HighlightTotalMs, HighlightPlayStart
     text := JsonGet(raw, "text")
@@ -410,6 +428,11 @@ HighlightOnStart(raw) {
 
 HighlightOnPlaying(raw) {
     global HighlightWords, HighlightPlayStart, HighlightTotalMs, HighlightGui
+    global HighlightCurrentIdx, HighlightPaused
+    ; Skip updates while paused (hover-pause).
+    if (HighlightPaused) {
+        return
+    }
     ; On first "playing" state, initialize the overlay from the full payload.
     if (HighlightGui = "") {
         text := JsonGet(raw, "text")
@@ -426,6 +449,7 @@ HighlightOnPlaying(raw) {
     ; Find the word whose [start_ms, end_ms) contains elapsed.
     idx := FindWordIndex(HighlightWords, elapsed)
     if (idx >= 0) {
+        HighlightCurrentIdx := idx
         SelectOverlayWord(idx)
     }
 }
@@ -438,8 +462,9 @@ HighlightOnStop() {
 ; --- Overlay GUI ---
 
 ShowHighlightOverlay(text) {
-    global HighlightGui
+    global HighlightGui, HighlightFullText
     HideHighlightOverlay()
+    HighlightFullText := text
     HighlightGui := Gui("+AlwaysOnTop -Caption +ToolWindow +E0x20")
     HighlightGui.BackColor := "1a1a2e"
     HighlightGui.SetFont("s12", "Segoe UI")
@@ -452,9 +477,105 @@ ShowHighlightOverlay(text) {
     HighlightGui.MarginX := 16
     HighlightGui.MarginY := 12
     editCtrl := HighlightGui.Add("Edit", "w" . (panelWidth - 32) . " h" . (panelHeight - 24) . " -VScroll -E0x200 cWhite Background1a1a2e", text)
+    ; Hover-pause: when mouse enters the overlay, pause speech.
+    ; Mouse leaves: resume from current word.
+    HighlightGui.OnEvent("MouseMove", OverlayHoverPause)
+    ; Click on the Edit control: rewind to the clicked word.
+    OnMessage(0x201, OverlayClickHandler)  ; WM_LBUTTONDOWN
     ; Make the window translucent (220/255 opacity).
     HighlightGui.Show("x" . panelX . " y" . panelY . " w" . panelWidth . " h" . panelHeight . " NA")
     SetTranslucent(HighlightGui.Hwnd, 220)
+}
+
+OverlayHoverPause(*) {
+    global HighlightPaused, HighlightGui
+    if (HighlightGui = "" or HighlightPaused) {
+        return
+    }
+    HighlightPaused := true
+    ; Stop the daemon playback (it will remember nothing — resume re-sends text from current word).
+    StopSpeechDaemon()
+}
+
+OverlayMouseLeaveResume(*) {
+    global HighlightPaused, HighlightGui, HighlightCurrentIdx
+    if (HighlightGui = "" or !HighlightPaused) {
+        return
+    }
+    HighlightPaused := false
+    ; Resume from the current word index.
+    if (HighlightCurrentIdx >= 0) {
+        SeekFromWord(HighlightCurrentIdx)
+    }
+}
+
+OverlayClickHandler(wParam, lParam, msg, hwnd) {
+    global HighlightGui, HighlightWords
+    if (HighlightGui = "") {
+        return
+    }
+    ; Get the character position under the cursor via EM_CHARFROMPOS = 0xD7.
+    ctrlHwnd := 0
+    try {
+        ctrl := HighlightGui["Edit1"]
+        if IsObject(ctrl) {
+            ctrlHwnd := ctrl.Hwnd
+        }
+    } catch {
+        return
+    }
+    if (ctrlHwnd = 0 or hwnd != ctrlHwnd) {
+        return
+    }
+    ; lParam has the client coordinates (low word = x, high word = y).
+    px := lParam & 0xFFFF
+    py := (lParam >> 16) & 0xFFFF
+    ; EM_CHARFROMPOS returns char index in low word, line in high word.
+    charIdx := SendMessage(0xD7, 0, (py << 16) | px, ctrlHwnd)
+    charIdx := charIdx & 0xFFFF
+    ; Find which word this char belongs to.
+    idx := FindWordByChar(HighlightWords, charIdx)
+    if (idx >= 0) {
+        SeekFromWord(idx)
+    }
+}
+
+FindWordByChar(words, charIdx) {
+    ; words is 1-based AHK array of [word, startMs, endMs, charStart, charEnd].
+    i := 1
+    while (i <= words.Length) {
+        w := words[i]
+        if (charIdx >= w[4] and charIdx <= w[5]) {
+            return i - 1  ; 0-based index
+        }
+        i++
+    }
+    return -1
+}
+
+SeekFromWord(idx) {
+    global HighlightFullText, RequestPath, ResponsePath, HighlightPath
+    global HighlightCurrentIdx
+    HighlightCurrentIdx := idx
+    ; Stop current playback.
+    StopSpeechDaemon()
+    ; Clear state and send a seek request.
+    try FileDelete ResponsePath
+    try FileDelete HighlightPath
+    jsonText := JsonEscape(HighlightFullText)
+    req := '{"action":"speak","text":"' . jsonText . '","from_word":' . idx . '}'
+    FileAppend req, RequestPath, "UTF-8"
+    ; Restart the highlight timer.
+    StartHighlightTimer()
+}
+
+StopSpeechDaemon() {
+    global RequestPath, ResponsePath
+    if IsDaemonReady() {
+        try FileDelete ResponsePath
+        FileAppend '{"action":"stop"}', RequestPath, "UTF-8"
+        WaitResponse(3)
+    }
 }
 
 SelectOverlayWord(idx) {
@@ -487,11 +608,13 @@ SelectOverlayWord(idx) {
 }
 
 HideHighlightOverlay() {
-    global HighlightGui
+    global HighlightGui, HighlightPaused, HighlightCurrentIdx
     if HighlightGui != "" {
         try HighlightGui.Destroy()
         HighlightGui := ""
     }
+    HighlightPaused := false
+    HighlightCurrentIdx := -1
 }
 
 ; --- JSON helpers (minimal regex parsing, no external lib) ---
