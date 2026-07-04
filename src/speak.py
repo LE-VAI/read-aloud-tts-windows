@@ -379,6 +379,17 @@ def main() -> int:
     setup_logging()
     try:
         if args.serve:
+            # Pre-flight: verify piper is importable before loading
+            # speak_server (which imports piper at module level). Without
+            # this, a Python interpreter lacking piper crashes on import
+            # and hangs as a zombie process instead of exiting cleanly.
+            try:
+                import piper  # noqa: F401
+            except ImportError:
+                print("speak_server: piper not installed in this interpreter",
+                      file=sys.stderr)
+                logging.error("piper not importable; cannot serve")
+                return 1
             from speak_server import serve
             return serve()
         if args.set_voice:

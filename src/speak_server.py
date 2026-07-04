@@ -361,6 +361,42 @@ def serve() -> int:
     lets AHK communicate via simple file I/O with ~20ms latency.
     """
     setup_logging()
+
+    # Early exit if piper isn't importable in this interpreter. Without
+    # piper the daemon can't synthesize, so there's no point starting. This
+    # also prevents zombie processes when the wrong Python interpreter is
+    # invoked (e.g. system Python without piper installed).
+    try:
+        import piper  # noqa: F401
+    except ImportError:
+        logging.error("piper not importable in this interpreter; exiting")
+        print("speak_server: piper not installed in this interpreter", file=sys.stderr)
+        return 1
+
+    # Single-instance guard: a Windows named mutex is the correct primitive
+    # here — acquisition is atomic (no race window), and the OS releases it
+    # automatically when the process exits, so no cleanup is needed. PID
+    # files and file locks both had race conditions on Windows.
+    import ctypes
+    from ctypes import wintypes
+
+    MUTEX_ALL_ACCESS = 0x1F0001
+    ERROR_ALREADY_EXISTS = 0xB7
+    _mutex_name = u"Global\\ReadAloudTTS_speak_server_singleton"
+    kernel32 = ctypes.windll.kernel32
+    kernel32.CreateMutexW.restype = wintypes.HANDLE
+    kernel32.CreateMutexW.argtypes = [wintypes.LPCVOID, wintypes.BOOL, wintypes.LPCWSTR]
+    _mutex_handle = kernel32.CreateMutexW(None, False, _mutex_name)
+    last_error = ctypes.get_last_error()
+    WAIT_TIMEOUT = 0x102
+    wait_result = kernel32.WaitForSingleObject(_mutex_handle, 0)
+    if wait_result == WAIT_TIMEOUT or last_error == ERROR_ALREADY_EXISTS:
+        logging.info("Another speak_server daemon is already running; exiting")
+        return 0
+    if not _mutex_handle:
+        logging.error("Could not create single-instance mutex; exiting")
+        return 1
+
     logging.info("speak_server starting")
 
     # Pre-load the default voice so the first request is fast.
@@ -378,6 +414,45 @@ def serve() -> int:
     request_path = APP_DIR / "tmp" / "request.json"
     response_path = APP_DIR / "tmp" / "response.json"
 
+    # Speak requests run in a worker thread so the main loop keeps polling
+    # for stop/quit requests while audio is playing. Without this, a blocking
+    # winsound.PlaySound call in handle_speak would prevent the daemon from
+    # reading a stop request until the first speak finished — making stop
+    # impossible.
+    _speak_thread: threading.Thread | None = None
+    _speak_lock = threading.Lock()
+
+    def run_speak_async(text: str, from_word: int) -> dict[str, str]:
+        """Run handle_speak in a background thread.
+
+        Returns immediately with a "started" response; the actual speak
+        result is logged. Stop requests are handled by the main loop which
+        sets _stop_requested via handle_stop().
+        """
+        global _stop_requested
+
+        def _worker() -> None:
+            try:
+                handle_speak(text, from_word)
+            except Exception as e:
+                logging.error("speak worker failed: %s", e)
+
+        nonlocal _speak_thread
+        # If a previous speak is still running, signal stop and wait for the
+        # worker to exit before starting a new one. This guarantees only one
+        # playback thread is alive at any time — no overlapping voices.
+        if _speak_thread and _speak_thread.is_alive():
+            _stop_requested = True
+            try:
+                import winsound as _ws
+                _ws.PlaySound(None, 0)  # Cancel in-flight audio immediately.
+            except Exception:
+                pass
+            _speak_thread.join(timeout=3.0)
+        _speak_thread = threading.Thread(target=_worker, daemon=True)
+        _speak_thread.start()
+        return {"status": "ok", "message": "Speak started"}
+
     while True:
         try:
             if request_path.exists():
@@ -394,18 +469,29 @@ def serve() -> int:
                 action = request.get("action", "")
                 if action == "quit":
                     logging.info("speak_server quitting")
+                    # Stop any in-flight playback before shutting down.
+                    handle_stop()
+                    if _speak_thread and _speak_thread.is_alive():
+                        _speak_thread.join(timeout=2.0)
                     response_path.write_text(
                         json.dumps({"status": "ok", "message": "bye"}),
                         encoding="utf-8",
                     )
                     ready_path.unlink(missing_ok=True)
+                    kernel32.ReleaseMutex(_mutex_handle)
+                    kernel32.CloseHandle(_mutex_handle)
                     return 0
                 elif action == "speak":
-                    response = handle_speak(request.get("text", ""), int(request.get("from_word", 0)))
+                    response = run_speak_async(
+                        request.get("text", ""),
+                        int(request.get("from_word", 0)),
+                    )
                 elif action == "set_voice":
                     response = handle_set_voice(request.get("voice", ""))
                 elif action == "stop":
                     response = handle_stop()
+                elif action == "ping":
+                    response = {"status": "ok", "message": "pong"}
                 else:
                     response = {"status": "error", "message": f"Unknown action: {action}"}
 
@@ -413,6 +499,8 @@ def serve() -> int:
         except KeyboardInterrupt:
             logging.info("speak_server interrupted, shutting down")
             ready_path.unlink(missing_ok=True)
+            kernel32.ReleaseMutex(_mutex_handle)
+            kernel32.CloseHandle(_mutex_handle)
             return 0
         except Exception as e:
             logging.error("speak_server loop error: %s", e)
