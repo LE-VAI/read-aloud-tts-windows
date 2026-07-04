@@ -28,6 +28,7 @@ import json
 import logging
 import os
 import re
+import shutil
 import struct
 import sys
 import threading
@@ -45,6 +46,7 @@ from speak import (
     APP_DIR,
     CONFIG_PATH,
     LOG_PATH,
+    TMP_DIR,
     chunk_text,
     load_config,
     normalize_text,
@@ -306,12 +308,48 @@ def handle_speak(text: str, from_word: int = 0) -> dict[str, str]:
         timer.start()
 
         # Play all chunks sequentially.
-        for ci, (wav_bytes, _samples, _sr) in enumerate(synth_results):
-            if _stop_requested:
-                break
-            winsound.PlaySound(wav_bytes, winsound.SND_MEMORY)
-            if not _stop_requested and ci < len(synth_results) - 1 and inter_chunk_pause > 0:
-                time.sleep(inter_chunk_pause)
+        #
+        # CRITICAL: We use SND_FILENAME (file-based) + SND_ASYNC (non-blocking)
+        # and poll _stop_requested in a tight loop on the worker thread. This
+        # is the ONLY reliable way to interrupt winsound playback mid-chunk:
+        #
+        #   - SND_MEMORY: PlaySound(None,0) from another thread cannot
+        #     interrupt it — Windows pins the buffer and plays to exhaustion.
+        #   - SND_FILENAME (blocking): PlaySound(None,0) from another thread
+        #     deadlocks or is silently ignored on many Windows builds.
+        #   - SND_FILENAME + SND_ASYNC: playback starts in the background,
+        #     the worker thread polls _stop_requested every 30ms, and when
+        #     stop is detected the SAME thread calls PlaySound(None,0) to
+        #     cancel — which works reliably because it's the same thread
+        #     that owns the playback session.
+        import tempfile
+        playback_temp_dir = Path(tempfile.mkdtemp(prefix="playback-", dir=TMP_DIR))
+        try:
+            for ci, (wav_bytes, samples, sr) in enumerate(synth_results):
+                if _stop_requested:
+                    break
+                chunk_path = playback_temp_dir / f"play-{ci:04d}.wav"
+                chunk_path.write_bytes(wav_bytes)
+                # Calculate chunk duration from sample count + sample rate.
+                chunk_duration_s = (samples / sr) if sr > 0 else 1.0
+                # Start playback asynchronously (non-blocking).
+                winsound.PlaySound(str(chunk_path), winsound.SND_FILENAME | winsound.SND_ASYNC)
+                # Poll for stop or playback completion. We know the chunk's
+                # duration from the sample count, so we exit the loop when
+                # the expected playback time has elapsed OR stop is requested.
+                # The 0.15s buffer accounts for async startup latency.
+                poll_end = time.time() + chunk_duration_s + 0.15
+                while not _stop_requested and time.time() < poll_end:
+                    time.sleep(0.03)
+                # Cancel any remaining async playback (no-op if already done).
+                winsound.PlaySound(None, 0)
+                if _stop_requested:
+                    break
+                if not _stop_requested and ci < len(synth_results) - 1 and inter_chunk_pause > 0:
+                    time.sleep(inter_chunk_pause)
+        finally:
+            winsound.PlaySound(None, 0)  # ensure no lingering async playback
+            shutil.rmtree(playback_temp_dir, ignore_errors=True)
 
         _stop_requested = True  # signal timer to stop
         timer.join(timeout=1.0)

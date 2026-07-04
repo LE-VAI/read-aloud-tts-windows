@@ -10,7 +10,7 @@ ReadAloudTTS is source-only, privacy-first, and designed to stay out of the way.
 
 ## The one-second pitch
 
-Select any text. Press **`Home`**. It speaks. Press **`F8`** to stop. That's the whole interaction — no menus, no dialogs, no cloud round-trip. The Piper voice model is loaded once at startup and stays warm, so the first read is the only one with a brief model-load delay. Every read after that is near-instant.
+Select any text. Press **`Home`**. It speaks. Press **`F6`** to stop. That's the whole interaction — no menus, no dialogs, no cloud round-trip. The Piper voice model is loaded once at startup and stays warm, so the first read is the only one with a brief model-load delay. Every read after that is near-instant.
 
 ## Hotkeys
 
@@ -18,14 +18,13 @@ ReadAloudTTS ships with several hotkeys so you can pick whichever fits your work
 
 | Action | Hotkey | Notes |
 | --- | --- | --- |
-| **Read selection** | `Home` | Single key. Fastest for daily use. |
-| Read selection | `F6` or `F12` | Function-key alternatives if `Home` conflicts with an app. |
+| **Read selection** | `Home` | Single key. The main player. Fastest for daily use. |
 | Read selection | `Ctrl + Right-click` | The original gesture. Leaves normal right-click menus intact. |
-| **Stop speech** | `F8` | Single key. Mirrors the single-key read convenience. |
-| Stop speech | `Ctrl + Alt + Space` | The original two-handed stop gesture. |
-| Show transcript | `Ctrl + Alt + T` | Opens the recent-speech transcript. |
+| **Stop speech** | `F6` | Single key. Cancels speech immediately, mid-sentence. |
 
 Hotkeys are plain AutoHotkey v2 bindings near the top of `ReadAloudTTS.ahk`. Remap any of them to your own keys in seconds — see [Remapping hotkeys](#remapping-hotkeys) below.
+
+> **Logitech MX Keys / compact keyboards:** If `F6` triggers a media key (brightness, volume) instead of a real F-key, press **`Fn + Esc`** to toggle the function-key lock. When the lock is on, F6 sends F6 directly — no `Fn` needed.
 
 ## Highlights
 
@@ -33,7 +32,7 @@ Hotkeys are plain AutoHotkey v2 bindings near the top of `ReadAloudTTS.ahk`. Rem
 | --- | --- |
 | Offline speech | Uses locally installed Piper after voice download. |
 | Single-key read | Press `Home` on any selection to hear it instantly. No chord, no menu. |
-| Single-key stop | Press `F8` to cancel speech the moment you've heard enough. |
+| Single-key stop | Press `F6` to cancel speech the moment you've heard enough — even mid-sentence. |
 | Clipboard care | Temporarily copies selection, then restores your previous clipboard contents. |
 | Natural cadence | Configurable sentence pauses, inter-chunk gaps, and Piper prosody knobs. |
 | Pipelined playback | Chunk N+1 is synthesized while chunk N plays, minimizing gaps. |
@@ -42,7 +41,7 @@ Hotkeys are plain AutoHotkey v2 bindings near the top of `ReadAloudTTS.ahk`. Rem
 ## What it does
 
 - Reads selected text from any app that supports normal copy.
-- Offers single-key hotkeys (`Home`, `F6`, `F12`) for read and `F8` for stop, plus the original `Ctrl + Right-click` / `Ctrl + Alt + Space` gestures.
+- Offers single-key hotkeys: `Home` to read, `F6` to stop — plus `Ctrl + Right-click` as an alternative read gesture.
 - Restores your previous clipboard contents after temporarily copying the selected text.
 - Runs from the Windows tray with actions for reading, stopping, voice selection, config, and logs.
 - Uses Piper TTS locally after voices are downloaded.
@@ -104,8 +103,8 @@ powershell -NoProfile -ExecutionPolicy Bypass -File .\uninstall.ps1 -RemoveAppDa
 ## Usage
 
 1. Select text in any app that supports copy.
-2. Press `Home` (or `F6` / `F12` / `Ctrl + Right-click`).
-3. Press `F8` (or `Ctrl + Alt + Space`) to stop speech.
+2. Press `Home` (or `Ctrl + Right-click`).
+3. Press `F6` to stop speech.
 4. Use the tray menu to read, stop, change voice, open config, or open logs.
 
 ## Tuning speech cadence
@@ -123,9 +122,11 @@ After install, `config.json` (in the app folder, copied from `config.example.jso
 
 If a key is absent from `config.json`, the voice model's built-in defaults are used.
 
-## Why multiple hotkeys
+## Why these hotkeys
 
-Different workflows suit different keys. `Home` is the fastest daily driver — one tap on any selection and it speaks. `F6` and `F12` are there for apps that hijack `Home` (some terminals and editors do). `Ctrl + Right-click` is kept as the original gesture because Windows apps implement context menus differently and injecting a custom item into every app's right-click menu would be fragile and invasive; `Ctrl + Right-click` gives a consistent gesture while leaving the normal right-click menu alone.
+The interaction is deliberately minimal: **one key to read, one key to stop.** `Home` is the fastest daily driver — one tap on any selection and it speaks. `F6` mirrors that convenience for stop — one tap and speech cancels immediately, even mid-sentence. `Ctrl + Right-click` is kept as an alternative read gesture for users who prefer the mouse-driven flow; it leaves normal right-click menus intact.
+
+If `Home` or `F6` conflicts with an app (some terminals and editors hijack `Home`), remap either key in seconds — see below.
 
 ## Remapping hotkeys
 
