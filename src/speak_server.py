@@ -377,25 +377,33 @@ def serve() -> int:
     # here — acquisition is atomic (no race window), and the OS releases it
     # automatically when the process exits, so no cleanup is needed. PID
     # files and file locks both had race conditions on Windows.
+    #
+    # CRITICAL: use_last_error=True is required on the kernel32 handle so
+    # ctypes.get_last_error() actually returns ERROR_ALREADY_EXISTS after
+    # CreateMutexW opens an existing mutex. Without it, get_last_error()
+    # always returns 0 and the guard never blocks — every StartDaemon()
+    # call spawns a duplicate daemon, both read the same request.json, and
+    # concurrent winsound.PlaySound calls cancel each other (silence).
     import ctypes
     from ctypes import wintypes
 
-    MUTEX_ALL_ACCESS = 0x1F0001
     ERROR_ALREADY_EXISTS = 0xB7
     _mutex_name = u"Global\\ReadAloudTTS_speak_server_singleton"
-    kernel32 = ctypes.windll.kernel32
+    kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)
     kernel32.CreateMutexW.restype = wintypes.HANDLE
     kernel32.CreateMutexW.argtypes = [wintypes.LPCVOID, wintypes.BOOL, wintypes.LPCWSTR]
     _mutex_handle = kernel32.CreateMutexW(None, False, _mutex_name)
     last_error = ctypes.get_last_error()
-    WAIT_TIMEOUT = 0x102
-    wait_result = kernel32.WaitForSingleObject(_mutex_handle, 0)
-    if wait_result == WAIT_TIMEOUT or last_error == ERROR_ALREADY_EXISTS:
-        logging.info("Another speak_server daemon is already running; exiting")
-        return 0
     if not _mutex_handle:
         logging.error("Could not create single-instance mutex; exiting")
         return 1
+    if last_error == ERROR_ALREADY_EXISTS:
+        logging.info("Another speak_server daemon is already running; exiting")
+        # Don't hold the handle — close it so we don't interfere with the
+        # existing owner. The OS keeps the named mutex alive as long as at
+        # least one process holds a handle to it.
+        kernel32.CloseHandle(_mutex_handle)
+        return 0
 
     logging.info("speak_server starting")
 
@@ -457,7 +465,17 @@ def serve() -> int:
         try:
             if request_path.exists():
                 try:
-                    request = json.loads(request_path.read_text(encoding="utf-8"))
+                    raw = request_path.read_bytes()
+                    # AHK v2 FileAppend with "UTF-8" writes a 3-byte BOM
+                    # (EF BB BF) at the start of the file. Python's
+                    # json.loads rejects BOM-prefixed JSON with
+                    # "Expecting value: line 1 column 1 (char 0)", which
+                    # silently broke every request from the AHK overlay
+                    # (the daemon replied "Unknown action: error" and no
+                    # audio played). Strip a leading UTF-8 BOM if present.
+                    if raw.startswith(b"\xef\xbb\xbf"):
+                        raw = raw[3:]
+                    request = json.loads(raw.decode("utf-8"))
                 except Exception as e:
                     request = {"action": "error", "message": str(e)}
                 # Delete the request file immediately so it's not re-read.
