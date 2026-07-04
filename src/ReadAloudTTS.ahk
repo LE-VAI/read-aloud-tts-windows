@@ -34,9 +34,24 @@ InitTray()
 
 ; Register hotkeys BEFORE StartDaemon so the keyboard hook is installed
 ; before the auto-execute section blocks on daemon warmup.
+;
+; Read hotkeys — any of these reads the current selection. Use whichever
+; is most convenient for your workflow or remap to your own below.
+;   Home          — single key, fastest for daily use
+;   F6, F12       — function-key alternatives
+;   Ctrl+Right-click — keeps the original gesture; normal right-click stays intact
 ^RButton::ReadSelection()
 ^RButton Up::SuppressCtrlRightClick()
+Home::ReadSelection()
+F6::ReadSelection()
+F12::ReadSelection()
+
+; Stop hotkeys — either one cancels in-flight speech immediately.
+;   F8              — single key, mirrors the single-key read convenience
+;   Ctrl+Alt+Space  — the original two-handed stop gesture
+F8::StopSpeech()
 ^!Space::StopSpeech()
+
 ^!t::ShowTranscript()
 
 StartDaemon()
