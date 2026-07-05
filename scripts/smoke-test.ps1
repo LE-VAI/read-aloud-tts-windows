@@ -38,6 +38,8 @@ $requiredFiles = @(
     "install.ps1",
     "uninstall.ps1",
     "download_voices.ps1",
+    "refresh-readaloud.ps1",
+    "refresh-readaloud.cmd",
     "src\ReadAloudTTS.ahk",
     "src\speak.py",
     "scripts\sanitize-check.ps1",
@@ -54,7 +56,7 @@ foreach ($relative in $requiredFiles) {
     }
 }
 
-foreach ($relative in @("install.ps1", "uninstall.ps1", "download_voices.ps1", "scripts\sanitize-check.ps1", "scripts\smoke-test.ps1")) {
+foreach ($relative in @("install.ps1", "uninstall.ps1", "download_voices.ps1", "refresh-readaloud.ps1", "scripts\sanitize-check.ps1", "scripts\smoke-test.ps1")) {
     Test-PowerShellSyntax -Path (Join-Path $repoRoot $relative)
 }
 

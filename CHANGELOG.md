@@ -1,5 +1,24 @@
 # Changelog
 
+## 0.7.0 - Daemon self-healing and one-click refresh
+
+### Added
+- **`refresh-readaloud.cmd` / `refresh-readaloud.ps1`**: one-click user-facing recovery helper. Sends a graceful quit to any stuck daemon (works regardless of process elevation, unlike `taskkill`), waits for the single-instance mutex to release, launches a fresh daemon, and verifies readiness. Safe to run at any time, even when the daemon is already healthy. Installed alongside the other scripts by `install.ps1`.
+- **`PruneStaleDaemon()`** in `ReadAloudTTS.ahk`: on startup, AHK now pings the daemon before pruning the readiness marker. If the daemon responds, the marker is kept (the daemon is alive). Only if the ping times out is the marker removed. This replaces the old blind `FileDelete` that could orphan a live daemon.
+- **Orphan recovery in `StartDaemon()`**: if a fresh daemon spawn fails to produce a readiness marker within 10s (because a previous daemon still holds the mutex), AHK sends a `quit` to the orphan, waits for the mutex to release, and retries the spawn once — automatically, with a tray notification.
+- **`SendDaemonQuit()`** helper in `ReadAloudTTS.ahk`: centralised the quit-IPC logic so `StopDaemon`, `StartDaemon` orphan recovery, and `PruneStaleDaemon` all share it.
+
+### Changed
+- **`speak_server.py` self-heals its readiness marker**: the daemon's main loop now checks every 20ms whether `tmp/daemon_ready` exists and recreates it if missing. This prevents the overnight desync where AHK loses track of a live daemon after the marker is deleted (by an AHK restart, cleanup script, or transient FS issue). The daemon is always "ready" while it's alive, so the marker now reflects that truth.
+- **`StopDaemon()` always sends a quit request** (previously only sent one if the marker existed). The quit IPC works across process elevation; the PID force-kill remains as a fallback.
+- **`RestartDaemon` tray item** now mentions `refresh-readaloud.cmd` in its failure toast.
+- **`install.ps1`** now deploys `refresh-readaloud.ps1` and `refresh-readaloud.cmd` to the install folder.
+- **`smoke-test.ps1`** validates the new refresh files exist and the PowerShell script parses cleanly.
+- **`docs/TROUBLESHOOTING.md`** documents the "Home does nothing" symptom and the refresh helper.
+
+### Root cause background
+The overnight issue: AHK deleted `daemon_ready` on every startup (even when the daemon was alive), then spawned a competitor that exited "already running" — leaving no marker and a live-but-orphaned daemon. Home silently did nothing because AHK thought the daemon wasn't ready. The self-healing marker (daemon side) and the ping-before-prune + orphan-recovery (AHK side) together close this gap. The refresh helper is the user-facing safety net.
+
 ## 0.6.0 - Transcript overlay
 
 ### Added
