@@ -28,8 +28,12 @@ global HighlightFullText := ""
 global TranscriptGui := ""
 
 DirCreate TempDir
-; Clean up any stale daemon readiness marker from a previous run.
-try FileDelete DaemonReadyPath
+; Don't blindly delete the readiness marker — if a daemon from a previous
+; session is still alive (holding the single-instance mutex), deleting the
+; marker orphans it and every subsequent Home press silently fails. Ping
+; first; only prune if no response. The daemon also self-heals its marker
+; (speak_server.py), so this is belt-and-suspenders.
+PruneStaleDaemon()
 InitTray()
 
 ; Register hotkeys BEFORE StartDaemon so the keyboard hook is installed
@@ -57,6 +61,31 @@ IsDaemonReady() {
     return FileExist(DaemonReadyPath) != ""
 }
 
+SendDaemonQuit(timeoutSec := 3) {
+    global RequestPath, ResponsePath
+    try FileDelete ResponsePath
+    FileAppend '{"action":"quit"}', RequestPath, "UTF-8"
+    return WaitResponse(timeoutSec)
+}
+
+PruneStaleDaemon() {
+    global DaemonReadyPath, RequestPath, ResponsePath
+    if !FileExist(DaemonReadyPath) {
+        return  ; No marker — nothing to prune. StartDaemon will spawn fresh.
+    }
+    ; Ping the daemon. If it responds, it's alive — keep the marker.
+    try FileDelete ResponsePath
+    FileAppend '{"action":"ping"}', RequestPath, "UTF-8"
+    if WaitResponse(2) {
+        return  ; Daemon is alive and responsive.
+    }
+    ; No response — stale marker from a crashed daemon. Remove it so
+    ; StartDaemon spawns a fresh process instead of assuming ready.
+    try FileDelete DaemonReadyPath
+    try FileDelete RequestPath
+    try FileDelete ResponsePath
+}
+
 StartDaemon() {
     global PyExe, AppDir, DaemonPidPath, DaemonReadyPath, Q
     if !FileExist(PyExe) {
@@ -66,13 +95,27 @@ StartDaemon() {
     if IsDaemonReady() {
         return  ; Already running and warmed up.
     }
-    ; Launch the long-lived speak_server daemon (hidden window).
     cmd := Q . PyExe . Q . " " . Q . AppDir . "\speak.py" . Q . " --serve"
     Run(cmd, AppDir, "Hide", &pid)
     try FileDelete DaemonPidPath
     FileAppend pid, DaemonPidPath, "UTF-8"
-    ; Wait up to 10s for the daemon to load the model and signal ready.
-    WaitDaemonReady(10)
+    if WaitDaemonReady(10) {
+        return  ; Daemon came up normally.
+    }
+    ; Marker didn't appear in 10s. The most likely cause: a previous
+    ; daemon is still alive holding the single-instance mutex, so the new
+    ; process exited immediately with "already running". Send a quit to
+    ; the orphan, wait for it to release the mutex, then retry once.
+    TrayTip "Recovering stuck TTS daemon...", "ReadAloudTTS"
+    SendDaemonQuit(3)
+    Sleep 800  ; Give the OS time to release the mutex after exit.
+    Run(cmd, AppDir, "Hide", &pid)
+    try FileDelete DaemonPidPath
+    FileAppend pid, DaemonPidPath, "UTF-8"
+    if WaitDaemonReady(10)
+        TrayTip "TTS daemon recovered", "ReadAloudTTS"
+    else
+        TrayTip "TTS daemon failed to start. Run refresh-readaloud.cmd", "ReadAloudTTS"
 }
 
 WaitDaemonReady(timeoutSec := 10) {
@@ -88,13 +131,12 @@ WaitDaemonReady(timeoutSec := 10) {
 
 StopDaemon() {
     global DaemonPidPath, DaemonReadyPath, RequestPath, ResponsePath
-    ; Send a quit request if the daemon is responsive.
-    if IsDaemonReady() {
-        req := '{"action":"quit"}'
-        FileAppend req, RequestPath, "UTF-8"
-        Sleep 500
-    }
-    ; Force-kill by PID if still alive.
+    ; Always send a quit request — the daemon may be alive even if the
+    ; marker is missing (though self-heal makes that unlikely now). The
+    ; quit IPC works regardless of process elevation, unlike taskkill.
+    SendDaemonQuit(2)
+    Sleep 500
+    ; Force-kill by PID if still alive (fallback if quit wasn't processed).
     if FileExist(DaemonPidPath) {
         pidText := Trim(FileRead(DaemonPidPath, "UTF-8"))
         if RegExMatch(pidText, "^\d+$") {
@@ -143,7 +185,7 @@ RestartDaemon(*) {
     if IsDaemonReady()
         TrayTip "TTS daemon restarted", "ReadAloudTTS"
     else
-        TrayTip "TTS daemon failed to start", "ReadAloudTTS"
+        TrayTip "TTS daemon failed to start. Try refresh-readaloud.cmd", "ReadAloudTTS"
 }
 
 ; ---------------------------------------------------------------------------

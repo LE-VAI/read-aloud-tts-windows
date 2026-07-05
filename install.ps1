@@ -95,7 +95,9 @@ $copyMap = @(
     @{ Source = Join-Path $srcDir "speak_server.py"; Target = Join-Path $InstallDir "speak_server.py" },
     @{ Source = Join-Path $sourceDir "download_voices.ps1"; Target = Join-Path $InstallDir "download_voices.ps1" },
     @{ Source = Join-Path $sourceDir "uninstall.ps1"; Target = Join-Path $InstallDir "uninstall.ps1" },
-    @{ Source = Join-Path $sourceDir "config.example.json"; Target = Join-Path $InstallDir "config.example.json" }
+    @{ Source = Join-Path $sourceDir "config.example.json"; Target = Join-Path $InstallDir "config.example.json" },
+    @{ Source = Join-Path $sourceDir "refresh-readaloud.ps1"; Target = Join-Path $InstallDir "refresh-readaloud.ps1" },
+    @{ Source = Join-Path $sourceDir "refresh-readaloud.cmd"; Target = Join-Path $InstallDir "refresh-readaloud.cmd" }
 )
 
 foreach ($item in $copyMap) {

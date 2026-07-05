@@ -1,5 +1,27 @@
 # Troubleshooting
 
+## Home does nothing / speech stops working
+
+**Symptom:** You press `Home` on selected text and nothing plays. This typically happens after sleep, hibernate, reboot, or an AutoHotkey reload — the AHK overlay loses track of the TTS daemon, even though the daemon process may still be alive in the background.
+
+**What's happening:** The daemon writes a `tmp\daemon_ready` marker file when it's warmed up. AHK checks this marker before speaking. If the marker gets deleted (e.g. AHK restarts and prunes stale state) while the daemon is still running, AHK spawns a new daemon — but the new process exits immediately because the old one holds a single-instance mutex. Home then silently does nothing.
+
+**Quick fix — one-click refresh:**
+
+Double-click `refresh-readaloud.cmd` in the install folder (`%LOCALAPPDATA%\ReadAloudTTS`), or run from PowerShell:
+
+```powershell
+powershell -NoProfile -ExecutionPolicy Bypass -File "$env:LOCALAPPDATA\ReadAloudTTS\refresh-readaloud.ps1"
+```
+
+This sends a graceful quit to any stuck daemon, waits for it to exit, launches a fresh one, and verifies it's ready. It works regardless of process elevation and is safe to run at any time, even if the daemon is already healthy.
+
+**Alternative fix — tray menu:**
+
+Right-click the ReadAloudTTS tray icon and choose **Restart Daemon**. This does the same quit-and-restart cycle from within AHK.
+
+**Why this should be rare now:** The daemon self-heals its readiness marker every 20ms (if anything deletes it, the daemon restores it immediately), and AHK pings the daemon before pruning the marker on startup. These two changes prevent the desync in the first place. The refresh helper is the safety net for edge cases.
+
 ## Ctrl + Right-click says no selected text found
 
 The active app may not support normal copy, the selected area may not contain text, or the app may block clipboard access.

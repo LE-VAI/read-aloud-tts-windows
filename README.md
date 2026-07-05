@@ -172,4 +172,4 @@ Read `docs/VOICE_LICENSING.md` before downloading or using voices, especially fo
 
 ## Troubleshooting
 
-See `docs/TROUBLESHOOTING.md`.
+If `Home` stops playing speech (typically after sleep, reboot, or an AHK reload), double-click `refresh-readaloud.cmd` in the install folder (`%LOCALAPPDATA%\ReadAloudTTS`). It restarts the TTS daemon in a few seconds and is safe to run at any time. See `docs/TROUBLESHOOTING.md` for more.

@@ -561,6 +561,21 @@ def serve() -> int:
         except Exception as e:
             logging.error("speak_server loop error: %s", e)
 
+        # Self-heal the readiness marker. If anything deleted it (AHK
+        # restarting and pruning stale state, a cleanup script, or a
+        # transient FS issue), the daemon is still alive and ready, so
+        # restore the marker immediately. Without this, AHK loses track
+        # of the daemon and every subsequent Home press silently fails
+        # because AHK spawns a competitor that exits with "already
+        # running" — the exact overnight-desync issue users hit after
+        # sleep/reboot/AHK-reload.
+        if not ready_path.exists():
+            try:
+                ready_path.write_text("ready", encoding="utf-8")
+                logging.info("daemon_ready marker was missing; restored")
+            except OSError:
+                pass
+
         time.sleep(0.02)  # 20ms poll interval
 
 
