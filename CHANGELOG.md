@@ -1,5 +1,15 @@
 # Changelog
 
+## 0.7.1 - Pipelined synthesis (12x faster first audio)
+
+### Fixed
+- **Critical: 12-53 second silence before first audio on multi-paragraph text.** The daemon's `handle_speak` synthesized ALL chunks to completion before playing even the first one. For a 2700-character selection (5 chunks) that meant 22-27s of silence before the user heard a single word. Longer texts waited 53s+. The original `speak.py` cold-start path pipelined (synth chunk N+1 while chunk N plays), but that optimization was lost when the daemon was built. **Now restored**: chunk 0 synthesizes synchronously, playback starts immediately, then chunk N+1 synthesizes in a background thread while chunk N plays.
+- Verified: 2700-char text went from **22-27s → 1.9s** time-to-first-audio (12x improvement).
+
+### Changed
+- **`chunk_chars` reduced from 2000 → 600** (`config.example.json`): smaller first chunk = faster first word. With 600 chars, chunk 0 synthesizes in ~1-2s instead of ~7s. Subsequent chunks stream behind it seamlessly with no audible gap.
+- **New log line `First audio after Xs`** in `speak_server.py`: the daemon now logs the exact time-to-first-audio so startup lag is measurable in production, not just the total synthesis time.
+
 ## 0.7.0 - Daemon self-healing and one-click refresh
 
 ### Added

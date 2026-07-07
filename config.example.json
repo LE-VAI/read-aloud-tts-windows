@@ -1,7 +1,7 @@
 {
   "current_voice": "en_US-lessac-medium",
   "max_chars": 30000,
-  "chunk_chars": 2000,
+  "chunk_chars": 600,
   "sentence_silence": 0.5,
   "inter_chunk_pause": 0.3,
   "length_scale": 1.0,

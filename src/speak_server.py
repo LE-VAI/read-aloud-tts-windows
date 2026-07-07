@@ -240,119 +240,138 @@ def handle_speak(text: str, from_word: int = 0) -> dict[str, str]:
 
     logging.info("Speaking %s chars using %s in %s chunks", len(text), voice_id, len(chunks))
     t_start = time.time()
+    t_first_audio: float | None = None
 
     import winsound
+    import tempfile
+    import shutil
 
     def synth_chunk(chunk_text: str) -> tuple[bytes, int, int]:
         return _synthesize_to_wav_bytes(voice, chunk_text, syn_config, sentence_silence)
 
-    # Build word timings across all chunks for the highlight overlay.
-    # Each chunk's words get timings relative to that chunk's audio, then we
-    # offset them by the cumulative duration of prior chunks (+ pauses).
+    # Pipelined synthesis + playback.
+    #
+    # PREVIOUS BUG: the daemon synthesized ALL chunks to completion before
+    # playing even the first one. For a 3-chunk selection that meant 12-53s
+    # of silence before the user heard anything — the original speak.py
+    # cold-start path pipelined (synth N+1 while N plays) but that
+    # optimization was lost when the daemon was built. We restore it here:
+    #
+    #   1. Synthesize chunk 0 synchronously (first audio must wait for it).
+    #   2. Start playing chunk 0.
+    #   3. While chunk 0 plays, synthesize chunk 1 in a background thread.
+    #   4. When chunk 0 finishes, wait for chunk 1's synth, then play it.
+    #   5. Repeat until done.
+    #
+    # Highlight word timings are computed per-chunk as each chunk is
+    # synthesized and appended to the running list — the overlay picks
+    # them up via the 30ms highlight_state poller.
+
     all_word_timings: list[list] = []
-    synth_results: list[tuple[bytes, int, int]] = []
-    # Synth first chunk synchronously to measure; pipeline the rest later.
-    # For highlight we need all timings up front, so synth all chunks first
-    # when there aren't too many (keeps it simple and correct).
-    # For large texts the pipeline still works — we just emit highlight
-    # state per-chunk as we go.
     chunk_offset_ms = 0.0
-    chunk_timings_list: list[list[list]] = []  # per chunk: [[word, s_ms, e_ms], ...]
+
+    # Shared pipeline state between the synth worker and the playback loop.
+    # pending[ci] holds (wav_bytes, samples, sr, wtimings) once chunk ci is
+    # synthesized; a threading.Event signals completion.
+    pending: dict[int, tuple[bytes, int, int, list[list]]] = {}
+    pending_events: dict[int, threading.Event] = {}
+    synth_errors: list[str] = []
+
+    def synth_worker(ci: int, chunk_text: str) -> None:
+        try:
+            wav_bytes, total_samples, sample_rate = synth_chunk(chunk_text)
+            # Store RAW (un-offset) word timings; the playback loop applies
+            # the offset when it consumes this chunk, because the offset
+            # depends on cumulative playback time which only the playback
+            # loop knows.
+            wtimings = _compute_word_timings(chunk_text, total_samples, sample_rate)
+            pending[ci] = (wav_bytes, total_samples, sample_rate, wtimings)
+        except Exception as e:
+            logging.error("Synth worker failed on chunk %d: %s", ci, e)
+            synth_errors.append(str(e))
+        finally:
+            if ci in pending_events:
+                pending_events[ci].set()
 
     with _playback_lock:
-        # Synthesize all chunks, building word timings.
-        for ci, chunk in enumerate(chunks):
-            if _stop_requested:
-                break
-            wav_bytes, total_samples, sample_rate = synth_chunk(chunk)
-            synth_results.append((wav_bytes, total_samples, sample_rate))
-            wtimings = _compute_word_timings(chunk, total_samples, sample_rate)
-            # Offset by cumulative prior playback time.
-            for wt in wtimings:
-                all_word_timings.append([wt[0], round(wt[1] + chunk_offset_ms, 1), round(wt[2] + chunk_offset_ms, 1)])
-            chunk_timings_list.append(wtimings)
-            chunk_offset_ms += (total_samples / sample_rate * 1000.0) if sample_rate else 0
-            chunk_offset_ms += inter_chunk_pause * 1000.0 if ci < len(chunks) - 1 else 0
-
-        t_synth = time.time()
-        logging.info("Synthesis took %.3fs, playback starting", t_synth - t_start)
-
-        if _stop_requested:
-            _clear_highlight_state()
-            return {"status": "ok", "message": "Stopped"}
-
-        # Start a timer thread that writes "playing" state with elapsed ms.
-        # Each state write includes the full text + word timings so the AHK
-        # overlay never needs to catch a transient "start" event — it can
-        # pick up mid-playback and still render the highlight correctly.
-        playback_start = time.time()
-        total_play_ms = chunk_offset_ms
-
-        def emit_playing() -> None:
-            while not _stop_requested:
-                elapsed = (time.time() - playback_start) * 1000.0
-                if elapsed >= total_play_ms:
-                    break
-                _write_highlight_state({
-                    "state": "playing",
-                    "text": text,
-                    "words": all_word_timings,
-                    "total_ms": round(total_play_ms, 1),
-                    "ms": round(elapsed, 1),
-                })
-                time.sleep(0.03)  # 30ms refresh
-            if not _stop_requested:
-                _write_highlight_state({"state": "done"})
-
-        timer = threading.Thread(target=emit_playing, daemon=True)
-        timer.start()
-
-        # Play all chunks sequentially.
-        #
-        # CRITICAL: We use SND_FILENAME (file-based) + SND_ASYNC (non-blocking)
-        # and poll _stop_requested in a tight loop on the worker thread. This
-        # is the ONLY reliable way to interrupt winsound playback mid-chunk:
-        #
-        #   - SND_MEMORY: PlaySound(None,0) from another thread cannot
-        #     interrupt it — Windows pins the buffer and plays to exhaustion.
-        #   - SND_FILENAME (blocking): PlaySound(None,0) from another thread
-        #     deadlocks or is silently ignored on many Windows builds.
-        #   - SND_FILENAME + SND_ASYNC: playback starts in the background,
-        #     the worker thread polls _stop_requested every 30ms, and when
-        #     stop is detected the SAME thread calls PlaySound(None,0) to
-        #     cancel — which works reliably because it's the same thread
-        #     that owns the playback session.
-        import tempfile
         playback_temp_dir = Path(tempfile.mkdtemp(prefix="playback-", dir=TMP_DIR))
         try:
-            for ci, (wav_bytes, samples, sr) in enumerate(synth_results):
+            for ci, chunk in enumerate(chunks):
                 if _stop_requested:
                     break
+
+                if ci == 0:
+                    # First chunk: synthesize synchronously on the playback
+                    # thread so we can start audio as fast as possible.
+                    wav_bytes, total_samples, sample_rate = synth_chunk(chunk)
+                    wtimings = _compute_word_timings(chunk, total_samples, sample_rate)
+                    for wt in wtimings:
+                        wt[1] = round(wt[1] + chunk_offset_ms, 1)
+                        wt[2] = round(wt[2] + chunk_offset_ms, 1)
+                    all_word_timings.extend(wtimings)
+                else:
+                    # Wait for the background synth worker to finish chunk ci.
+                    event = pending_events.get(ci)
+                    if event:
+                        event.wait(timeout=120.0)
+                    result = pending.get(ci)
+                    if result is None:
+                        if synth_errors:
+                            logging.error("Skipping chunk %d (synth failed): %s", ci, synth_errors[-1])
+                        break
+                    wav_bytes, total_samples, sample_rate, wtimings = result
+                    # Apply the cumulative playback offset to this chunk's
+                    # word timings (the worker stored raw timings).
+                    for wt in wtimings:
+                        wt[1] = round(wt[1] + chunk_offset_ms, 1)
+                        wt[2] = round(wt[2] + chunk_offset_ms, 1)
+                    all_word_timings.extend(wtimings)
+
+                if _stop_requested:
+                    break
+
+                # Start the background synth for the NEXT chunk while we play.
+                if ci + 1 < len(chunks):
+                    pending_events[ci + 1] = threading.Event()
+                    worker = threading.Thread(
+                        target=synth_worker,
+                        args=(ci + 1, chunks[ci + 1]),
+                        daemon=True,
+                    )
+                    worker.start()
+
+                # Write the WAV to a temp file and play it asynchronously.
                 chunk_path = playback_temp_dir / f"play-{ci:04d}.wav"
                 chunk_path.write_bytes(wav_bytes)
-                # Calculate chunk duration from sample count + sample rate.
-                chunk_duration_s = (samples / sr) if sr > 0 else 1.0
-                # Start playback asynchronously (non-blocking).
+                chunk_duration_s = (total_samples / sample_rate) if sample_rate else 1.0
+
                 winsound.PlaySound(str(chunk_path), winsound.SND_FILENAME | winsound.SND_ASYNC)
-                # Poll for stop or playback completion. We know the chunk's
-                # duration from the sample count, so we exit the loop when
-                # the expected playback time has elapsed OR stop is requested.
-                # The 0.15s buffer accounts for async startup latency.
+                if t_first_audio is None:
+                    t_first_audio = time.time()
+                    logging.info("First audio after %.3fs (synth of chunk 0)", t_first_audio - t_start)
+
+                # Poll for stop or chunk completion.
                 poll_end = time.time() + chunk_duration_s + 0.15
                 while not _stop_requested and time.time() < poll_end:
                     time.sleep(0.03)
-                # Cancel any remaining async playback (no-op if already done).
                 winsound.PlaySound(None, 0)
-                if _stop_requested:
-                    break
-                if not _stop_requested and ci < len(synth_results) - 1 and inter_chunk_pause > 0:
+
+                # Advance the cumulative playback time for word-timing offsets.
+                chunk_offset_ms += chunk_duration_s * 1000.0
+                if ci < len(chunks) - 1 and inter_chunk_pause > 0 and not _stop_requested:
                     time.sleep(inter_chunk_pause)
+                    chunk_offset_ms += inter_chunk_pause * 1000.0
         finally:
-            winsound.PlaySound(None, 0)  # ensure no lingering async playback
+            winsound.PlaySound(None, 0)
             shutil.rmtree(playback_temp_dir, ignore_errors=True)
 
-        _stop_requested = True  # signal timer to stop
-        timer.join(timeout=1.0)
+        if t_first_audio is None:
+            # No audio ever started — likely stopped before chunk 0 finished.
+            logging.info("Stopped before first audio; total elapsed %.3fs", time.time() - t_start)
+        else:
+            logging.info("All chunks played; total %.3fs", time.time() - t_start)
+
+        _stop_requested = True  # signal any pending synth worker to stop
         _write_highlight_state({"state": "done"})
 
     return {"status": "ok", "message": "Text spoken"}
