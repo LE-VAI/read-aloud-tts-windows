@@ -61,6 +61,27 @@ IsDaemonReady() {
     return FileExist(DaemonReadyPath) != ""
 }
 
+; Ping-verified readiness check. PruneStaleDaemon() runs once at AHK startup,
+; but if the daemon crashes mid-session the marker is left behind and
+; IsDaemonReady() returns a false positive — SpeakViaDaemon then writes to a
+; dead queue and WaitResponse hangs for 120s. This confirms the daemon is
+; actually alive before trusting the marker. Costs ~20ms when the daemon is
+; healthy (its poll interval); only pays the full 2s when the daemon is dead.
+EnsureDaemonAlive() {
+    global DaemonReadyPath, RequestPath, ResponsePath
+    if !FileExist(DaemonReadyPath)
+        return false  ; No marker — not ready. StartDaemon will spawn fresh.
+    try FileDelete ResponsePath
+    FileAppend '{"action":"ping"}', RequestPath, "UTF-8"
+    if WaitResponse(2)
+        return true  ; Daemon responded — alive and ready.
+    ; Stale marker from a crashed daemon. Clean up so StartDaemon respawns.
+    try FileDelete DaemonReadyPath
+    try FileDelete RequestPath
+    try FileDelete ResponsePath
+    return false
+}
+
 SendDaemonQuit(timeoutSec := 3) {
     global RequestPath, ResponsePath
     try FileDelete ResponsePath
@@ -295,12 +316,14 @@ ReadSelection(*) {
     StopSpeech()
     TrayTip "Reading selected text...", "ReadAloudTTS"
 
-    ; Try the daemon path first (fast — model pre-warmed).
-    if IsDaemonReady() {
+    ; Try the daemon path first (fast — model pre-warmed). Use the
+    ; ping-verified check: a stale marker from a crashed daemon would
+    ; otherwise send the request to a dead queue and hang for 120s.
+    if EnsureDaemonAlive() {
         SpeakViaDaemon(text)
     } else {
         StartDaemon()
-        if IsDaemonReady() {
+        if EnsureDaemonAlive() {
             SpeakViaDaemon(text)
         } else {
             SpeakColdStart(text)
