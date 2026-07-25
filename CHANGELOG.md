@@ -1,5 +1,17 @@
 # Changelog
 
+## Unreleased - Repo hardening
+
+### Added
+- **CI workflow** (`.github/workflows/ci.yml`): runs pytest, py_compile, sanitize-check, and smoke-test on every push and pull request (windows-latest).
+- **Issue templates**: bug report and feature request templates with environment fields.
+- **`.gitattributes`**: line-ending normalization — CRLF for `.ps1`/`.ahk`/`.cmd`, LF for `.py`/`.json`/`.md`, binary for assets.
+
+### Changed
+- **Smoke test** now validates `speak_server.py` syntax (previously only `speak.py`) and requires `.gitattributes`.
+- **CONTRIBUTING.md** pre-PR checklist updated to run pytest on both test suites instead of just `py_compile` on `speak.py`.
+- **`speak.py --serve`** path simplified: removed redundant piper pre-flight (now handled by `speak_server.serve()` via `_ensure_piper()`).
+
 ## 0.7.2 - Playback truncation fix and AI-tool copy compatibility
 
 ### Fixed
