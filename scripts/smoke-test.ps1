@@ -34,6 +34,7 @@ $requiredFiles = @(
     "CONTRIBUTING.md",
     "CHANGELOG.md",
     ".gitignore",
+    ".gitattributes",
     "config.example.json",
     "install.ps1",
     "uninstall.ps1",
@@ -72,7 +73,11 @@ if (-not $python) {
 }
 & $python.Source -m py_compile (Join-Path $repoRoot "src\speak.py")
 if ($LASTEXITCODE -ne 0) {
-    Fail "Python syntax validation failed."
+    Fail "Python syntax validation failed (speak.py)."
+}
+& $python.Source -m py_compile (Join-Path $repoRoot "src\speak_server.py")
+if ($LASTEXITCODE -ne 0) {
+    Fail "Python syntax validation failed (speak_server.py)."
 }
 $pythonCache = Join-Path $repoRoot "src\__pycache__"
 if (Test-Path -LiteralPath $pythonCache) {

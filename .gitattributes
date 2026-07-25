@@ -1,0 +1,20 @@
+# Normalize line endings — text files get LF in the repo, checked out as-is
+* text=auto
+
+# PowerShell and AutoHotkey scripts use CRLF on Windows
+*.ps1 text eol=crlf
+*.ahk text eol=crlf
+*.cmd text eol=crlf
+
+# Python uses LF
+*.py text eol=lf
+
+# JSON and Markdown use LF
+*.json text eol=lf
+*.md text eol=lf
+
+# Binary files
+*.png binary
+*.ico binary
+*.onnx binary
+*.wav binary

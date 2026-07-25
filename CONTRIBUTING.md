@@ -9,7 +9,7 @@ Run:
 ```powershell
 powershell -NoProfile -ExecutionPolicy Bypass -File .\scripts\sanitize-check.ps1
 powershell -NoProfile -ExecutionPolicy Bypass -File .\scripts\smoke-test.ps1
-python -m py_compile .\src\speak.py
+python -m pytest .\src\test_speak.py .\src\test_speak_server.py -v
 git diff --check
 ```
 

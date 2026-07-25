@@ -1,0 +1,26 @@
+---
+name: Bug report
+about: Report a problem with ReadAloudTTS
+title: "[Bug] "
+labels: bug
+---
+
+**Describe the bug**
+A clear description of what's happening.
+
+**To reproduce**
+1. Select text in ...
+2. Press `Home` ...
+3. ...
+
+**Expected behavior**
+What you expected to happen.
+
+**Environment**
+- Windows version:
+- ReadAloudTTS version: (run `python speak.py --version`)
+- AutoHotkey version:
+- Voice:
+
+**Logs**
+Do not paste logs containing private text or local paths. Share relevant log lines from `%LOCALAPPDATA%\ReadAloudTTS\logs\readaloud.log` after redacting personal content.
