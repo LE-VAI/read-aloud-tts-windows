@@ -40,8 +40,6 @@ from typing import Any
 # Make speak.py importable for shared functions.
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 
-from piper import PiperVoice, SynthesisConfig
-
 from speak import (
     APP_DIR,
     CONFIG_PATH,
@@ -53,17 +51,36 @@ from speak import (
     setup_logging,
 )
 
+# Piper is imported lazily (inside _load_voice / serve) so the pure-logic
+# functions (_compute_word_timings, _silence_bytes, chunk_text, etc.) can
+# be tested without Piper installed.
+_piper_available: bool | None = None
+
+
+def _ensure_piper():
+    """Import Piper on first use. Returns (PiperVoice, SynthesisConfig)."""
+    global _piper_available
+    if _piper_available is False:
+        raise ImportError("piper was not importable in this interpreter")
+    try:
+        from piper import PiperVoice, SynthesisConfig
+        _piper_available = True
+        return PiperVoice, SynthesisConfig
+    except ImportError:
+        _piper_available = False
+        raise
+
 # ---------------------------------------------------------------------------
 # Model cache
 # ---------------------------------------------------------------------------
 
-_voice_cache: dict[str, PiperVoice] = {}
+_voice_cache: dict[str, Any] = {}
 _current_voice_id: str | None = None
 _playback_lock = threading.Lock()
 _stop_requested = False
 
 
-def _load_voice(voice_id: str) -> PiperVoice | None:
+def _load_voice(voice_id: str) -> Any:
     """Load a PiperVoice model, caching it by voice_id for reuse."""
     if voice_id in _voice_cache:
         return _voice_cache[voice_id]
@@ -81,6 +98,7 @@ def _load_voice(voice_id: str) -> PiperVoice | None:
         logging.error("Voice files missing for %s", voice_id)
         return None
 
+    PiperVoice, _ = _ensure_piper()
     logging.info("Loading Piper model for voice: %s", voice_id)
     pv = PiperVoice.load(str(model_path), config_path=str(config_path))
     _voice_cache[voice_id] = pv
@@ -88,8 +106,9 @@ def _load_voice(voice_id: str) -> PiperVoice | None:
     return pv
 
 
-def _build_syn_config(config: dict[str, Any]) -> SynthesisConfig:
+def _build_syn_config(config: dict[str, Any]) -> Any:
     """Map config.json prosody keys to a SynthesisConfig."""
+    _, SynthesisConfig = _ensure_piper()
     kwargs: dict[str, Any] = {}
     if "length_scale" in config:
         kwargs["length_scale"] = float(config["length_scale"])
@@ -104,6 +123,8 @@ def _build_syn_config(config: dict[str, Any]) -> SynthesisConfig:
 def _silence_bytes(sample_rate: int, duration_s: float) -> bytes:
     """Generate N seconds of 16-bit mono silence."""
     num_samples = int(sample_rate * duration_s)
+    if num_samples <= 0:
+        return b""
     return struct.pack(f"<{num_samples}h", *([0] * num_samples))
 
 
@@ -220,7 +241,7 @@ def handle_speak(text: str, from_word: int = 0) -> dict[str, str]:
         return {"status": "error", "message": f"Voice not available: {voice_id}"}
 
     max_chars = int(config.get("max_chars", 30000))
-    chunk_chars = int(config.get("chunk_chars", 2000))
+    chunk_chars = int(config.get("chunk_chars", 600))
     text = normalize_text(text, max_chars)
     if not text:
         return {"status": "error", "message": "No text to speak"}
@@ -427,7 +448,7 @@ def serve() -> int:
     # also prevents zombie processes when the wrong Python interpreter is
     # invoked (e.g. system Python without piper installed).
     try:
-        import piper  # noqa: F401
+        _ensure_piper()
     except ImportError:
         logging.error("piper not importable in this interpreter; exiting")
         print("speak_server: piper not installed in this interpreter", file=sys.stderr)

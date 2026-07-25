@@ -21,6 +21,7 @@ CONFIG_PATH = APP_DIR / "config.json"
 LOG_PATH = APP_DIR / "logs" / "readaloud.log"
 TMP_DIR = APP_DIR / "tmp"
 PIPER_TIMEOUT_SECONDS = 90
+VERSION = "0.7.2"
 UNICODE_REPLACEMENTS = str.maketrans(
     {
         "\u2018": "'",
@@ -266,7 +267,7 @@ def speak_text(text: str) -> None:
         raise SystemExit(f"Voice files are missing for {voice_id}. Run download_voices.ps1.")
 
     max_chars = int(config.get("max_chars", 30000))
-    chunk_chars = int(config.get("chunk_chars", 900))
+    chunk_chars = int(config.get("chunk_chars", 600))
     text = normalize_text(text, max_chars)
     if not text:
         raise SystemExit("No text to speak.")
@@ -366,6 +367,7 @@ def main() -> int:
     parser.add_argument("--text")
     parser.add_argument("--set-voice")
     parser.add_argument("--list-voices", action="store_true")
+    parser.add_argument("--version", action="version", version=f"ReadAloudTTS {VERSION}")
     parser.add_argument("--delete-input-file", action="store_true")
     parser.add_argument(
         "--serve",
