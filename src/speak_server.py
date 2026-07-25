@@ -350,8 +350,11 @@ def handle_speak(text: str, from_word: int = 0) -> dict[str, str]:
                     t_first_audio = time.time()
                     logging.info("First audio after %.3fs (synth of chunk 0)", t_first_audio - t_start)
 
-                # Poll for stop or chunk completion.
-                poll_end = time.time() + chunk_duration_s + 0.15
+                # Poll for stop or chunk completion. The buffer must account
+                # for audio device startup latency (50-200ms on some drivers)
+                # plus a safety margin so the last word isn't truncated by
+                # the PlaySound(None, 0) cancel. 0.5s total buffer.
+                poll_end = time.time() + chunk_duration_s + 0.5
                 while not _stop_requested and time.time() < poll_end:
                     time.sleep(0.03)
                 winsound.PlaySound(None, 0)

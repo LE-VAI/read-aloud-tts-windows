@@ -168,5 +168,5 @@ if (-not $NoStart) {
 
 Write-Host ""
 Write-Host "ReadAloudTTS installed."
-Write-Host "Use Ctrl+Right-click on selected text to read it aloud."
-Write-Host "Use Ctrl+Alt+Space to stop speech."
+Write-Host "Press Home on selected text to read it aloud."
+Write-Host "Press F6 to stop speech."

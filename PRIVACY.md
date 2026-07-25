@@ -4,7 +4,7 @@ ReadAloudTTS is designed for local selected-text read aloud on Windows.
 
 ## Text handling
 
-When you press `Ctrl + Right-click`, the helper sends a normal copy command, reads the temporary clipboard text, restores the previous clipboard contents, writes the selected text to a temporary local input file, and asks Piper to synthesize speech locally. The temporary input file is deleted after the Python helper reads it.
+When you press `Home` (or `Ctrl + Right-click`), the helper sends a copy command, reads the temporary clipboard text, restores the previous clipboard contents, and asks Piper to synthesize speech locally.
 
 ## Network use
 

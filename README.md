@@ -113,7 +113,7 @@ After install, `config.json` (in the app folder, copied from `config.example.jso
 
 | Key | Default | Effect |
 | --- | --- | --- |
-| `chunk_chars` | `2000` | Maximum characters per Piper invocation. Lower values = more chunks (more cold starts); higher = fewer chunks (faster). |
+| `chunk_chars` | `600` | Maximum characters per Piper invocation. Lower values = faster first audio; higher = fewer chunks (fewer cold starts). |
 | `sentence_silence` | `0.5` | Seconds of silence Piper inserts after each sentence. Increase for more breathing room; decrease for faster delivery. |
 | `inter_chunk_pause` | `0.3` | Seconds of silence between chunk playbacks. Prevents abrupt merges at chunk boundaries. |
 | `length_scale` | `1.0` | Overall speech speed. `1.0` = natural, `0.8` = slower/clearer, `1.2` = faster. |

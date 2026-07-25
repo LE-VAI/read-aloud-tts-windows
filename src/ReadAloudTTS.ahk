@@ -296,7 +296,12 @@ ReadSelection(*) {
     savedClipboard := ClipboardAll()
     A_Clipboard := ""
     Sleep 40
-    Send "^c"
+    ; Use Ctrl+Insert instead of Ctrl+C to copy the selection. Ctrl+C is
+    ; intercepted by AI coding tools (ZCode, etc.) as "stop generation"
+    ; when text is selected during streaming/thinking output. Ctrl+Insert
+    ; is the Windows legacy copy shortcut — Chrome, Electron, and most
+    ; text editors respect it, but AI tools don't bind it to "stop."
+    Send "{Ctrl down}{Insert}{Ctrl up}"
 
     if !ClipWait(1.2) {
         RestoreClipboard(savedClipboard)
@@ -718,7 +723,7 @@ ShowTranscript(*) {
         savedClipboard := ClipboardAll()
         A_Clipboard := ""
         Sleep 40
-        Send "^c"
+        Send "{Ctrl down}{Insert}{Ctrl up}"
         if ClipWait(1.0) {
             text := A_Clipboard
         }

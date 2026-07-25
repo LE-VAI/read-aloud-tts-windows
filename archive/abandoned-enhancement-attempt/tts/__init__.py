@@ -1,3 +1,0 @@
-"""
-TTS package for ReadAloudTTS.
-"""

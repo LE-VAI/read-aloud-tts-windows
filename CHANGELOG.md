@@ -1,5 +1,17 @@
 # Changelog
 
+## 0.7.2 - Playback truncation fix and AI-tool copy compatibility
+
+### Fixed
+- **Last word of a paragraph was sometimes cut off.** The playback completion poll in `speak_server.py` used a 0.15s buffer after the chunk duration — not enough for audio devices with 50-200ms startup latency. `PlaySound(None, 0)` cancelled audio before the final word finished. Buffer increased to 0.5s.
+- **Pressing `Home` on selected text in AI coding tools (ZCode, etc.) stopped the agent's generation.** The AHK overlay used `Send ^c` (Ctrl+C) to copy the selection, which AI tools intercept as "stop generation" during streaming/thinking. Changed to `Send {Ctrl down}{Insert}{Ctrl up}` (Ctrl+Insert — the Windows legacy copy shortcut, respected by Chrome/Electron/text editors but not bound to "stop" by AI tools).
+
+### Changed
+- **Documentation aligned with 0.7 hotkeys.** USAGE.md, PRIVACY.md, and install.ps1 final message updated from stale `Ctrl+Alt+Space` / `Ctrl+Right-click` references to current `Home` (read) / `F6` (stop).
+- **README `chunk_chars` table corrected** from 2000 to 600 (matching config.example.json and the 0.7.1 change).
+- **USAGE.md config section expanded** with all prosody knobs (sentence_silence, inter_chunk_pause, length_scale, noise_scale, noise_w) and the current default values.
+- **USAGE.md tray menu list updated** to include Show Transcript and Restart Daemon (added in 0.6.0 and 0.7.0 but never documented).
+
 ## 0.7.1 - Pipelined synthesis (12x faster first audio)
 
 ### Fixed
