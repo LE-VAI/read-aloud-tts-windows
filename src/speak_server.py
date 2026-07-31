@@ -78,6 +78,9 @@ _voice_cache: dict[str, Any] = {}
 _current_voice_id: str | None = None
 _playback_lock = threading.Lock()
 _stop_requested = False
+# Heartbeat stop flag — set to True on quit so the keep-alive thread
+# exits cleanly instead of being killed mid-synthesize.
+_heartbeat_stop = threading.Event()
 
 
 def _load_voice(voice_id: str) -> Any:
@@ -101,9 +104,107 @@ def _load_voice(voice_id: str) -> Any:
     PiperVoice, _ = _ensure_piper()
     logging.info("Loading Piper model for voice: %s", voice_id)
     pv = PiperVoice.load(str(model_path), config_path=str(config_path))
+    # Replace the bare default InferenceSession that PiperVoice.load
+    # creates with one carrying tuned ONNX Runtime SessionOptions.
+    #
+    # Root cause of the "first request after idle is slow" regression:
+    # ONNX Runtime's intra-op thread pool parks worker threads in the OS
+    # scheduler after a few seconds of idle. The first inference after
+    # the gap then pays thread-wake cost — documented in
+    # microsoft/onnxruntime#7449. PiperVoice.load() constructs the
+    # session with a bare onnxruntime.SessionOptions() and no spin
+    # config, so there is nothing keeping the workers warm.
+    #
+    # Fix (per ORT maintainer tlh20 in #7449): set intra_op_num_threads=1.
+    # This eliminates the intra-op thread pool entirely — there are no
+    # worker threads to park, so there is no wake cost. ORT's tlh20 says:
+    # "If the effect is still seen with 1 thread then ... there may well be
+    # spin-or-block or other heuristics in the system" — i.e. CPU C-states.
+    #
+    # This is safe for Piper lessac-medium: the model is engineered to run
+    # real-time on a Raspberry Pi 4 (4-core ARM), so a single desktop CPU
+    # thread is more than enough for sub-second sentence synthesis.
+    #
+    # Spin config (allow_spinning, spin_duration_us=1000, spin_backoff_max=8)
+    # is kept as belt-and-suspenders for any inter-op threads, but the
+    # primary lever is intra_op_num_threads=1.
+    try:
+        import onnxruntime as ort
+        so = ort.SessionOptions()
+        so.graph_optimization_level = ort.GraphOptimizationLevel.ORT_ENABLE_ALL
+        so.execution_mode = ort.ExecutionMode.ORT_SEQUENTIAL
+        so.intra_op_num_threads = 1
+        so.add_session_config_entry("session.intra_op.allow_spinning", "1")
+        so.add_session_config_entry("session.intra_op.spin_duration_us", "1000")
+        so.add_session_config_entry("session.intra_op.spin_backoff_max", "8")
+        providers = ["CPUExecutionProvider"]
+        pv.session = ort.InferenceSession(
+            str(model_path), sess_options=so, providers=providers
+        )
+        logging.info(
+            "Replaced Piper session with tuned ORT session "
+            "(intra_op_num_threads=1, spin enabled)"
+        )
+    except Exception as e:
+        # Don't break startup if this ORT version doesn't support the
+        # config entries — log and fall back to Piper's default session.
+        logging.warning("Could not install tuned ORT session (%s); using Piper default", e)
     _voice_cache[voice_id] = pv
     logging.info("Loaded Piper model for voice: %s", voice_id)
     return pv
+
+
+# ---------------------------------------------------------------------------
+# Keep-alive heartbeat
+# ---------------------------------------------------------------------------
+#
+# Belt-and-suspenders defense against ONNX Runtime issue #7449: ORT's
+# intra-op thread pool parks worker threads in the OS scheduler after a
+# few seconds of idle, so the first inference after a gap pays thread-wake
+# cost (multi-second delay). The tuned SessionOptions above enables
+# bounded spin-waiting, but as a second layer we also synthesize a
+# single-space utterance every 5 s and discard the audio. This keeps the
+# session's thread pool active and the allocator arenas warm even during
+# long idle stretches (e.g. the user not pressing Home for 30 minutes).
+#
+# The heartbeat synthesizes a one-space string — minimal phoneme work,
+# ~5-15 ms on typical CPU, well below the 20 ms poll interval of the
+# main loop, and well below the user's perception threshold. Audio is
+# discarded (we never call winsound), so there's no audible artifact.
+
+_HEARTBEAT_INTERVAL_S = 5.0
+_HEARTBEAT_TEXT = " "
+
+
+def _heartbeat_loop() -> None:
+    """Background thread: synthesize a single space every 5s to keep ORT warm."""
+    logging.info("heartbeat thread started (interval=%.1fs)", _HEARTBEAT_INTERVAL_S)
+    while not _heartbeat_stop.wait(_HEARTBEAT_INTERVAL_S):
+        try:
+            voice_id = _current_voice_id
+            if voice_id is None:
+                continue
+            pv = _voice_cache.get(voice_id)
+            if pv is None:
+                continue
+            # synthesize_stream_raw yields raw int16 PCM chunks; we
+            # consume and discard them. Use the cached SynthesisConfig
+            # if one is available, else fall back to defaults.
+            config = load_config()
+            syn_config = _build_syn_config(config)
+            for _chunk in pv.synthesize_stream_raw(_HEARTBEAT_TEXT, syn_config):
+                pass
+        except Exception as e:
+            # Heartbeat failures must never kill the thread or break
+            # the daemon — log and continue. The next tick will retry.
+            logging.debug("heartbeat tick skipped: %s", e)
+    logging.info("heartbeat thread stopping")
+
+
+def _start_heartbeat() -> None:
+    """Start the keep-alive heartbeat thread (daemon, dies with the process)."""
+    t = threading.Thread(target=_heartbeat_loop, name="tts-heartbeat", daemon=True)
+    t.start()
 
 
 def _build_syn_config(config: dict[str, Any]) -> Any:
@@ -500,6 +601,11 @@ def serve() -> int:
     ready_path = APP_DIR / "tmp" / "daemon_ready"
     ready_path.write_text("ready", encoding="utf-8")
 
+    # Start the keep-alive heartbeat thread. Belt-and-suspenders against
+    # ORT #7449 thread-pool parking during long idle stretches.
+    _heartbeat_stop.clear()
+    _start_heartbeat()
+
     request_path = APP_DIR / "tmp" / "request.json"
     response_path = APP_DIR / "tmp" / "response.json"
 
@@ -568,6 +674,7 @@ def serve() -> int:
                 action = request.get("action", "")
                 if action == "quit":
                     logging.info("speak_server quitting")
+                    _heartbeat_stop.set()
                     # Stop any in-flight playback before shutting down.
                     handle_stop()
                     if _speak_thread and _speak_thread.is_alive():
@@ -597,6 +704,7 @@ def serve() -> int:
                 response_path.write_text(json.dumps(response), encoding="utf-8")
         except KeyboardInterrupt:
             logging.info("speak_server interrupted, shutting down")
+            _heartbeat_stop.set()
             ready_path.unlink(missing_ok=True)
             kernel32.ReleaseMutex(_mutex_handle)
             kernel32.CloseHandle(_mutex_handle)

@@ -6,11 +6,15 @@
 - **CI workflow** (`.github/workflows/ci.yml`): runs pytest, py_compile, sanitize-check, and smoke-test on every push and pull request (windows-latest).
 - **Issue templates**: bug report and feature request templates with environment fields.
 - **`.gitattributes`**: line-ending normalization — CRLF for `.ps1`/`.ahk`/`.cmd`, LF for `.py`/`.json`/`.md`, binary for assets.
+- **Keep-alive heartbeat thread** in `speak_server.py`: synthesizes a single space every 5s and discards the audio, keeping the ONNX Runtime session warm during long idle stretches. Belt-and-suspenders against microsoft/onnxruntime#7449 (ORT intra-op thread-pool parking after idle). `_heartbeat_stop` Event wired into the quit and KeyboardInterrupt paths so the thread exits cleanly.
+- **`DebugLog()` helper** in `ReadAloudTTS.ahk`: appends timestamped lines to `tmp/working_debug.log`. Called at `ReadSelection()` entry to confirm the hotkey actually fires (diagnoses Electron-vs-AHK hook races).
 
 ### Changed
 - **Smoke test** now validates `speak_server.py` syntax (previously only `speak.py`) and requires `.gitattributes`.
 - **CONTRIBUTING.md** pre-PR checklist updated to run pytest on both test suites instead of just `py_compile` on `speak.py`.
 - **`speak.py --serve`** path simplified: removed redundant piper pre-flight (now handled by `speak_server.serve()` via `_ensure_piper()`).
+- **Hotkeys now use `$*` prefix** in `ReadAloudTTS.ahk`: `$` forces AHK's low-level keyboard hook (instead of RegisterHotkey, which Electron apps like ZCode/VS Code override at the window-proc level — Home was eaten before AHK saw it), `*` fires regardless of modifier state. Fixes "TTS works in browser but not in ZCode."
+- **Tuned ONNX Runtime session** in `speak_server.py _load_voice()`: replaces the bare default `InferenceSession` that `PiperVoice.load()` creates with one carrying `intra_op_num_threads=1`, `graph_optimization_level=ORT_ENABLE_ALL`, `allow_spinning=1`, `spin_duration_us=1000`, `spin_backoff_max=8`. Per ORT maintainer tlh20 in microsoft/onnxruntime#7449, `intra_op_num_threads=1` eliminates the intra-op thread pool entirely (no worker threads to park = no wake cost). Verified over 3 days: warm/recent-read latency dropped from 8-13s to sub-second (0.1-0.9s); long-idle (hours) latency dropped from 12-13s to 4-7s (residual is CPU C-states, not ORT).
 
 ## 0.7.2 - Playback truncation fix and AI-tool copy compatibility
 

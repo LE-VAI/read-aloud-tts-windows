@@ -43,12 +43,18 @@ InitTray()
 ;   Home = read the current text selection
 ;   F6   = stop speech immediately
 ; Remap either by editing the bindings below. See README "Remapping hotkeys".
-^RButton::ReadSelection()
-^RButton Up::SuppressCtrlRightClick()
-Home::ReadSelection()
-F6::StopSpeech()
+; Hotkeys use the $* prefix:
+;   $ = low-level keyboard hook (not RegisterHotkey), which wins the race
+;       vs Electron apps (ZCode, VS Code, etc.) that bind the same keys at
+;       the window-proc level. Without $, Home is eaten by the editor
+;       before AHK sees it — TTS works in browsers but not in Electron.
+;   * = fire regardless of modifier state (belt-and-suspenders).
+$*^RButton::ReadSelection()
+$*^RButton Up::SuppressCtrlRightClick()
+$*Home::ReadSelection()
+$*F6::StopSpeech()
 
-^!t::ShowTranscript()
+$*^!t::ShowTranscript()
 
 StartDaemon()
 
@@ -288,6 +294,10 @@ SuppressCtrlRightClick(*) {
 ReadSelection(*) {
     global PyExe, AppDir, PidPath, TempDir, Q, RequestPath, ResponsePath
 
+    ; Hotkey-fired diagnostic — confirm the hook actually triggers in
+    ; Electron apps (ZCode) where Home is normally eaten by the editor.
+    DebugLog("ReadSelection() fired — host=" . WinGetProcessName("A"))
+
     if !FileExist(PyExe) {
         TrayTip "Python environment missing. Run install.ps1.", "ReadAloudTTS"
         return
@@ -384,6 +394,13 @@ JsonEscape(text) {
     text := StrReplace(text, "`r", "\r")
     text := StrReplace(text, "`t", "\t")
     return text
+}
+
+DebugLog(msg) {
+    global TempDir
+    logPath := TempDir . "\working_debug.log"
+    ts := FormatTime(A_Now, "yyyy-MM-dd HH:mm:ss")
+    try FileAppend "[" . ts . "] " . msg . "`n", logPath, "UTF-8"
 }
 
 RestoreClipboard(savedClipboard) {
