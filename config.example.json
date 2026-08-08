@@ -29,6 +29,20 @@
       "config": "voices/en_US-hfc_female-medium.onnx.json",
       "model_card": "https://huggingface.co/rhasspy/piper-voices/blob/main/en/en_US/hfc_female/medium/MODEL_CARD",
       "license_note": "Sensitive: the hfc_female model card references CC BY-NC-SA 4.0 dataset licensing."
+    },
+    "en_US-libritts_r-medium": {
+      "label": "LibriTTS-R - audiobook",
+      "model": "voices/en_US-libritts_r-medium.onnx",
+      "config": "voices/en_US-libritts_r-medium.onnx.json",
+      "model_card": "https://huggingface.co/rhasspy/piper-voices/blob/main/en/en_US/libritts_r/medium/MODEL_CARD",
+      "license_note": "LibriTTS-R: re-recorded LibriVox audiobooks. Best for long-form narration."
+    },
+    "en_US-lessac-high": {
+      "label": "Lessac High - studio",
+      "model": "voices/en_US-lessac-high.onnx",
+      "config": "voices/en_US-lessac-high.onnx.json",
+      "model_card": "https://huggingface.co/rhasspy/piper-voices/blob/main/en/en_US/lessac/high/MODEL_CARD",
+      "license_note": "Higher quality Lessac voice. ~114MB. Smoother sustained vowels, reduced VITS shimmer."
     }
   }
 }

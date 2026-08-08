@@ -326,6 +326,20 @@ def _synthesize_to_wav_bytes(
         chunk_bytes = chunk.audio_int16_bytes
         pcm.write(chunk_bytes)
         total_samples += len(chunk_bytes) // 2  # 16-bit = 2 bytes/sample
+
+    # Append trailing silence after the last sentence. Piper by design
+    # adds no silence after the final sentence of a synthesis call (per
+    # --sentence-silence docs: "all but the last"). Without a tail, the
+    # audio ends abruptly at the last phoneme and any timing slop in the
+    # playback poll cancels the last word mid-phoneme. 0.3s of trailing
+    # silence gives an acoustic buffer so premature cancel only clips
+    # silence, not speech.
+    TRAILING_SILENCE_S = 0.3
+    trailing = _silence_bytes(sample_rate, TRAILING_SILENCE_S)
+    if trailing:
+        pcm.write(trailing)
+        total_samples += int(sample_rate * TRAILING_SILENCE_S)
+
     raw_pcm = pcm.getvalue()
 
     # Wrap in a WAV container for winsound.PlaySound.
@@ -496,13 +510,18 @@ def handle_speak(text: str, from_word: int = 0) -> dict[str, str]:
                     logging.info("First audio after %.3fs (synth of chunk 0)", t_first_audio - t_start)
 
                 # Poll for stop or chunk completion. The buffer must account
-                # for audio device startup latency (50-200ms on some drivers)
-                # plus a safety margin so the last word isn't truncated by
-                # the PlaySound(None, 0) cancel. 0.5s total buffer.
-                poll_end = time.time() + chunk_duration_s + 0.5
+                # for audio device startup latency (WASAPI IAudioClient::Initialize
+                # can take ~500ms on Realtek/Intel hardware — see Microsoft Q&A
+                # 1168479). 0.8s total buffer = 0.5s device-open margin + 0.3s
+                # trailing silence margin (added in _synthesize_to_wav_bytes).
+                # Only cancel with PlaySound(None, 0) if the user requested stop;
+                # otherwise let the audio finish naturally — the trailing
+                # silence ensures the poll ending early only clips silence.
+                poll_end = time.time() + chunk_duration_s + 0.8
                 while not _stop_requested and time.time() < poll_end:
                     time.sleep(0.03)
-                winsound.PlaySound(None, 0)
+                if _stop_requested:
+                    winsound.PlaySound(None, 0)
 
                 # Advance the cumulative playback time for word-timing offsets.
                 chunk_offset_ms += chunk_duration_s * 1000.0

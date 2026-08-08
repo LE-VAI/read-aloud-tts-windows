@@ -136,7 +136,7 @@ if (-not (Test-Path -LiteralPath $venvPython)) {
 
 Write-Host "Installing Piper TTS into the local app environment..."
 & $venvPython -m pip install --upgrade pip
-& $venvPython -m pip install "piper-tts==1.4.2"
+& $venvPython -m pip install "piper-tts>=1.6.0"
 
 if (-not $SkipVoiceDownload) {
     Write-Host ""

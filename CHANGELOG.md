@@ -1,6 +1,6 @@
 # Changelog
 
-## Unreleased - Repo hardening
+## Unreleased - Quality and stability pass
 
 ### Added
 - **On-the-fly speed control** — adjust reading speed without restarting the daemon or reloading the voice model:
@@ -13,13 +13,22 @@
   - Range: 0.5 (2× faster) to 2.0 (2× slower), clamped to prevent artifacts at extremes
   - `handle_set_speed()` in `speak_server.py` sets a `_runtime_length_scale` override that `synth_chunk()` picks up per-chunk (rebuilds `SynthesisConfig` each call). Piper's `length_scale` is a per-call ONNX input, not a model property — zero cost to change between calls.
 - **Fast-start first chunk** — `first_chunk_chars` config option (default 150) caps the first chunk at a small size so audio starts in 1-2s instead of 6-13s. Chunk 0 is synthesized synchronously before playback begins, so a full 600-char chunk at `length_scale=1.2` meant 6-13s of silence before first audio. Subsequent chunks pipeline (synth N+1 while N plays) so they remain full-size (600 chars). `chunk_text()` in `speak.py` gained a `first_chunk_chars` parameter.
+- **New voices** — `en_US-libritts_r-medium` (LibriTTS-R audiobook corpus, paragraph-aware prosody, 904-speaker model) and `en_US-lessac-high` (higher-quality Lessac, smoother sustained vowels, reduced VITS shimmer, ~114MB). Both available in config and tray menu voice switcher.
 - **CI workflow** (`.github/workflows/ci.yml`): runs pytest, py_compile, sanitize-check, and smoke-test on every push and pull request (windows-latest).
 - **Issue templates**: bug report and feature request templates with environment fields.
 - **`.gitattributes`**: line-ending normalization — CRLF for `.ps1`/`.ahk`/`.cmd`, LF for `.py`/`.json`/`.md`, binary for assets.
 - **Keep-alive heartbeat thread** in `speak_server.py`: synthesizes a single space every 5s and discards the audio, keeping the ONNX Runtime session warm during long idle stretches. Belt-and-suspenders against microsoft/onnxruntime#7449 (ORT intra-op thread-pool parking after idle). `_heartbeat_stop` Event wired into the quit and KeyboardInterrupt paths so the thread exits cleanly.
 - **`DebugLog()` helper** in `ReadAloudTTS.ahk`: appends timestamped lines to `tmp/working_debug.log`. Called at `ReadSelection()` entry to confirm the hotkey actually fires (diagnoses Electron-vs-AHK hook races).
 
+### Fixed
+- **Intermittent last-word truncation** — three compounding causes fixed:
+  1. **Trailing silence appended** to PCM after the last sentence (0.3s). Piper by design adds no silence after the final sentence of a synthesis call (per `--sentence-silence` docs: "all but the last"). Without a tail, audio ends abruptly at the last phoneme and any timing slop cancels the word mid-phoneme.
+  2. **`PlaySound(None, 0)` no longer called unconditionally** — only fires when the user requests stop. Previously it fired after every poll-timer expiry, truncating audio still playing due to variable WASAPI device-open latency (~500ms on Realtek/Intel hardware — see Microsoft Q&A 1168479). The 0.5s buffer was the same order of magnitude as device startup, explaining the "sometimes randomly" intermittency.
+  3. **Poll buffer increased** from 0.5s to 0.8s (0.5s device-open margin + 0.3s trailing silence margin).
+- **Config corruption resilience** — `load_config()` in `speak.py` now catches `JSONDecodeError`, `FileNotFoundError`, and `OSError`, falling back to `_default_config()` defaults instead of crashing the daemon. Logs a warning so the user knows config was reset.
+
 ### Changed
+- **Upgraded piper-tts 1.4.2 → 1.6.0** — gains default speaker id for multi-speaker voices (needed for libritts_r), bumped embedded espeak-ng, fixed pathvalidate dependency, added Hebrew phonemizer. No breaking Python API changes.
 - **Smoke test** now validates `speak_server.py` syntax (previously only `speak.py`) and requires `.gitattributes`.
 - **CONTRIBUTING.md** pre-PR checklist updated to run pytest on both test suites instead of just `py_compile` on `speak.py`.
 - **`speak.py --serve`** path simplified: removed redundant piper pre-flight (now handled by `speak_server.serve()` via `_ensure_piper()`).

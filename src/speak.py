@@ -53,8 +53,30 @@ def notify_error(message: str) -> None:
 
 
 def load_config() -> dict[str, Any]:
-    with CONFIG_PATH.open("r", encoding="utf-8") as file:
-        return json.load(file)
+    """Load config.json, falling back to defaults on corruption or missing file."""
+    try:
+        with CONFIG_PATH.open("r", encoding="utf-8") as file:
+            return json.load(file)
+    except (json.JSONDecodeError, FileNotFoundError, OSError) as e:
+        import logging
+        logging.warning("Config load failed (%s) — using fallback defaults", e)
+        return _default_config()
+
+
+def _default_config() -> dict[str, Any]:
+    """Return a minimal valid config when config.json is missing or corrupt."""
+    return {
+        "current_voice": "en_US-lessac-medium",
+        "max_chars": 30000,
+        "chunk_chars": 600,
+        "first_chunk_chars": 150,
+        "sentence_silence": 0.75,
+        "inter_chunk_pause": 0.3,
+        "length_scale": 1.2,
+        "noise_scale": 0.667,
+        "noise_w": 0.8,
+        "voices": {},
+    }
 
 
 def save_config(config: dict[str, Any]) -> None:
