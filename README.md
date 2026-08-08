@@ -21,6 +21,9 @@ ReadAloudTTS ships with several hotkeys so you can pick whichever fits your work
 | **Read selection** | `Home` | Single key. The main player. Fastest for daily use. |
 | Read selection | `Ctrl + Right-click` | The original gesture. Leaves normal right-click menus intact. |
 | **Stop speech** | `F6` | Single key. Cancels speech immediately, mid-sentence. |
+| **Speed up** | `Ctrl + =` | 10% faster. Takes effect on the next chunk. |
+| **Speed down** | `Ctrl + -` | 10% slower. Takes effect on the next chunk. |
+| **Reset speed** | `Ctrl + 0` | Back to normal (1.0×). |
 
 Hotkeys are plain AutoHotkey v2 bindings near the top of `ReadAloudTTS.ahk`. Remap any of them to your own keys in seconds — see [Remapping hotkeys](#remapping-hotkeys) below.
 
@@ -33,6 +36,7 @@ Hotkeys are plain AutoHotkey v2 bindings near the top of `ReadAloudTTS.ahk`. Rem
 | Offline speech | Uses locally installed Piper after voice download. |
 | Single-key read | Press `Home` on any selection to hear it instantly. No chord, no menu. |
 | Single-key stop | Press `F6` to cancel speech the moment you've heard enough — even mid-sentence. |
+| On-the-fly speed | `Ctrl + =` / `Ctrl + -` to adjust speed, `Ctrl + 0` to reset. Persists across restarts. |
 | Clipboard care | Temporarily copies selection, then restores your previous clipboard contents. |
 | Natural cadence | Configurable sentence pauses, inter-chunk gaps, and Piper prosody knobs. |
 | Pipelined playback | Chunk N+1 is synthesized while chunk N plays, minimizing gaps. |

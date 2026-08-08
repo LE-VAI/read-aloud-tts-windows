@@ -43,18 +43,22 @@ InitTray()
 ;   Home = read the current text selection
 ;   F6   = stop speech immediately
 ; Remap either by editing the bindings below. See README "Remapping hotkeys".
-; Hotkeys use the $* prefix:
-;   $ = low-level keyboard hook (not RegisterHotkey), which wins the race
-;       vs Electron apps (ZCode, VS Code, etc.) that bind the same keys at
-;       the window-proc level. Without $, Home is eaten by the editor
-;       before AHK sees it — TTS works in browsers but not in Electron.
-;   * = fire regardless of modifier state (belt-and-suspenders).
 $*^RButton::ReadSelection()
 $*^RButton Up::SuppressCtrlRightClick()
 $*Home::ReadSelection()
 $*F6::StopSpeech()
 
 $*^!t::ShowTranscript()
+
+; Speed control — on-the-fly rate adjustment.
+;   Ctrl+= (or Ctrl++) = faster
+;   Ctrl+-             = slower
+;   Ctrl+0             = reset to normal (1.0)
+; Takes effect on the next chunk being synthesized, not the currently
+; playing one. Persists to config.json so it survives restarts.
+$*^=::AdjustSpeed(0.9)
+$*^+::AdjustSpeed(1.1)
+$*^0::ResetSpeed()
 
 StartDaemon()
 
@@ -184,6 +188,7 @@ InitTray() {
     A_TrayMenu.Delete()
     A_TrayMenu.Add("Read Selection`tCtrl+Right-click", (*) => ReadSelection())
     A_TrayMenu.Add("Stop`tCtrl+Alt+Space", (*) => StopSpeech())
+    A_TrayMenu.Add("Speed: " . GetSpeedLabel(), (*) => CycleSpeed())
     A_TrayMenu.Add()
 
     voiceMenu := Menu()
@@ -204,6 +209,39 @@ InitTray() {
     A_TrayMenu.Add("Restart Daemon", (*) => RestartDaemon())
     A_TrayMenu.Add("Exit", (*) => ExitApp())
     A_TrayMenu.Default := "Read Selection`tCtrl+Right-click"
+}
+
+GetSpeedLabel() {
+    speed := GetCurrentSpeed()
+    if (speed < 1.0) {
+        mult := 1.0 / speed
+        return Round(mult, 1) . "x faster (Ctrl+=/Ctrl+-)"
+    } else if (speed > 1.0) {
+        return Round(speed, 1) . "x slower (Ctrl+=/Ctrl+-)"
+    } else {
+        return "Normal (Ctrl+=/Ctrl+-)"
+    }
+}
+
+CycleSpeed(*) {
+    ; Cycle through common presets: normal → 1.2x slower → 1.5x slower → 0.8x faster → normal
+    current := GetCurrentSpeed()
+    presets := [1.0, 1.2, 1.5, 0.8]
+    nextIdx := 0
+    for i, p in presets {
+        if (Abs(current - p) < 0.05) {
+            nextIdx := i < presets.Length ? i + 1 : 1
+            break
+        }
+    }
+    target := presets[nextIdx > 0 ? nextIdx : 1]
+    ; Send the target speed directly.
+    global RequestPath, ResponsePath
+    try FileDelete ResponsePath
+    FileAppend '{"action":"set_speed","speed":' . target . '}', RequestPath, "UTF-8"
+    WaitResponse(3)
+    InitTray()
+    TrayTip GetSpeedLabel(), "ReadAloudTTS Speed"
 }
 
 RestartDaemon(*) {
@@ -394,6 +432,78 @@ JsonEscape(text) {
     text := StrReplace(text, "`r", "\r")
     text := StrReplace(text, "`t", "\t")
     return text
+}
+
+; ---------------------------------------------------------------------------
+; Speed control (on-the-fly length_scale adjustment)
+; ---------------------------------------------------------------------------
+; Sends a "set_speed" action to the daemon. The daemon updates the runtime
+; length_scale override (takes effect on the next chunk) and persists to
+; config.json. We read the current speed from config.json to compute the
+; new value — the daemon is the source of truth, so we reload from disk
+; each time (the daemon writes atomically).
+
+GetCurrentSpeed() {
+    global ConfigPath
+    try {
+        content := FileRead(ConfigPath, "UTF-8")
+        if RegExMatch(content, '"length_scale"\s*:\s*([\d.]+)', &m) {
+            return Round(m[1], 2)
+        }
+    }
+    return 1.0
+}
+
+SendSpeed(speed) {
+    global RequestPath, ResponsePath
+    speed := Max(0.5, Min(2.0, Round(speed, 2)))
+    ; Read current speed from config to avoid accumulating rounding drift.
+    current := GetCurrentSpeed()
+    ; If the daemon set a runtime override, it also wrote it to config,
+    ; so reading config gives us the live value.
+    newSpeed := Max(0.5, Min(2.0, Round(current * speed, 2)))
+    if (newSpeed = current)
+        return  ; No change needed.
+    try FileDelete ResponsePath
+    req := '{"action":"set_speed","speed":' . newSpeed . '}'
+    FileAppend req, RequestPath, "UTF-8"
+    if WaitResponse(3) {
+        ; Read the daemon's response for a human-friendly label.
+        try {
+            resp := FileRead(ResponsePath, "UTF-8")
+        } catch {
+            resp := ""
+        }
+    }
+    ; Show a tray tip with the new speed.
+    if (newSpeed < 1.0) {
+        mult := 1.0 / newSpeed
+        label := Round(mult, 1) . "x faster"
+    } else if (newSpeed > 1.0) {
+        label := Round(newSpeed, 1) . "x slower"
+    } else {
+        label := "normal speed"
+    }
+    TrayTip label, "ReadAloudTTS Speed"
+}
+
+AdjustSpeed(factor) {
+    ; factor < 1 = faster (e.g. 0.9 = 10% faster)
+    ; factor > 1 = slower (e.g. 1.1 = 10% slower)
+    SendSpeed(factor)
+}
+
+ResetSpeed() {
+    global RequestPath, ResponsePath
+    current := GetCurrentSpeed()
+    if (current = 1.0) {
+        TrayTip "Already normal speed", "ReadAloudTTS Speed"
+        return
+    }
+    try FileDelete ResponsePath
+    FileAppend '{"action":"set_speed","speed":1.0}', RequestPath, "UTF-8"
+    WaitResponse(3)
+    TrayTip "Normal speed", "ReadAloudTTS Speed"
 }
 
 DebugLog(msg) {

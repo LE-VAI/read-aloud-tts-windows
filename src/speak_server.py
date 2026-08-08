@@ -78,6 +78,12 @@ _voice_cache: dict[str, Any] = {}
 _current_voice_id: str | None = None
 _playback_lock = threading.Lock()
 _stop_requested = False
+# Runtime speed override (length_scale). When non-None, overrides the
+# config.json value so on-the-fly speed changes (Ctrl+=/Ctrl+-/Ctrl+0)
+# take effect on the next chunk without waiting for config reload.
+# Set by the "set_speed" action; cleared back to None by a reset (1.0
+# also writes to config so it persists across restarts).
+_runtime_length_scale: float | None = None
 # Heartbeat stop flag — set to True on quit so the keep-alive thread
 # exits cleanly instead of being killed mid-synthesize.
 _heartbeat_stop = threading.Event()
@@ -208,10 +214,17 @@ def _start_heartbeat() -> None:
 
 
 def _build_syn_config(config: dict[str, Any]) -> Any:
-    """Map config.json prosody keys to a SynthesisConfig."""
+    """Map config.json prosody keys to a SynthesisConfig.
+
+    If _runtime_length_scale is set (via on-the-fly speed control),
+    it overrides the config value so speed changes take effect on
+    the next chunk without a config reload.
+    """
     _, SynthesisConfig = _ensure_piper()
     kwargs: dict[str, Any] = {}
-    if "length_scale" in config:
+    if _runtime_length_scale is not None:
+        kwargs["length_scale"] = _runtime_length_scale
+    elif "length_scale" in config:
         kwargs["length_scale"] = float(config["length_scale"])
     if "noise_scale" in config:
         kwargs["noise_scale"] = float(config["noise_scale"])
@@ -356,7 +369,6 @@ def handle_speak(text: str, from_word: int = 0) -> dict[str, str]:
         logging.info("Seeking from word %s, remaining: %s chars", from_word, len(text))
 
     chunks = chunk_text(text, chunk_chars)
-    syn_config = _build_syn_config(config)
     sentence_silence = float(config.get("sentence_silence", 0.5))
     inter_chunk_pause = float(config.get("inter_chunk_pause", 0.3))
 
@@ -369,7 +381,12 @@ def handle_speak(text: str, from_word: int = 0) -> dict[str, str]:
     import shutil
 
     def synth_chunk(chunk_text: str) -> tuple[bytes, int, int]:
-        return _synthesize_to_wav_bytes(voice, chunk_text, syn_config, sentence_silence)
+        # Rebuild syn_config per chunk so on-the-fly speed changes
+        # (Ctrl+=/Ctrl+-/Ctrl+0) take effect on the next chunk,
+        # not only on the next speak request.
+        cfg = load_config()
+        syn_cfg = _build_syn_config(cfg)
+        return _synthesize_to_wav_bytes(voice, chunk_text, syn_cfg, sentence_silence)
 
     # Pipelined synthesis + playback.
     #
@@ -514,6 +531,34 @@ def handle_set_voice(voice_id: str) -> dict[str, str]:
     CONFIG_PATH.write_text(json.dumps(config, indent=2) + "\n", encoding="utf-8")
     logging.info("Voice set to %s", voice_id)
     return {"status": "ok", "message": f"Voice set to {voice_id}"}
+
+
+def handle_set_speed(speed: float) -> dict[str, str]:
+    """Set the speaking speed (length_scale) on the fly.
+
+    Takes effect on the next chunk being synthesized — no model reload,
+    no daemon restart. Also persists to config.json so it survives
+    restarts.
+
+    Range: 0.5 (2x faster) to 2.0 (2x slower). Default 1.0.
+    """
+    global _runtime_length_scale
+    speed = max(0.5, min(2.0, round(speed, 2)))
+    _runtime_length_scale = speed
+    # Persist to config so it survives restarts.
+    config = load_config()
+    config["length_scale"] = speed
+    CONFIG_PATH.write_text(json.dumps(config, indent=2) + "\n", encoding="utf-8")
+    logging.info("Speed set to %.2f", speed)
+    # Return a human-friendly multiplier (1.0 = normal, 0.5 = 2x fast, 2.0 = 2x slow)
+    if speed < 1.0:
+        mult = 1.0 / speed
+        label = f"{mult:.1f}x faster"
+    elif speed > 1.0:
+        label = f"{speed:.1f}x slower"
+    else:
+        label = "normal speed"
+    return {"status": "ok", "message": label, "speed": speed}
 
 
 def handle_stop() -> dict[str, str]:
@@ -694,6 +739,8 @@ def serve() -> int:
                     )
                 elif action == "set_voice":
                     response = handle_set_voice(request.get("voice", ""))
+                elif action == "set_speed":
+                    response = handle_set_speed(float(request.get("speed", 1.0)))
                 elif action == "stop":
                     response = handle_stop()
                 elif action == "ping":

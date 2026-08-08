@@ -3,6 +3,15 @@
 ## Unreleased - Repo hardening
 
 ### Added
+- **On-the-fly speed control** — adjust reading speed without restarting the daemon or reloading the voice model:
+  - `Ctrl+=` (or `Ctrl++`) = 10% faster
+  - `Ctrl+-` = 10% slower
+  - `Ctrl+0` = reset to normal (1.0×)
+  - Tray menu "Speed:" item shows current speed and cycles through presets (normal → 1.2× slower → 1.5× slower → 0.8× faster)
+  - Speed changes take effect on the **next chunk** being synthesized (standard TTS behavior — audio already playing is not affected)
+  - Persists to `config.json` (`length_scale` key), survives restarts
+  - Range: 0.5 (2× faster) to 2.0 (2× slower), clamped to prevent artifacts at extremes
+  - `handle_set_speed()` in `speak_server.py` sets a `_runtime_length_scale` override that `synth_chunk()` picks up per-chunk (rebuilds `SynthesisConfig` each call). Piper's `length_scale` is a per-call ONNX input, not a model property — zero cost to change between calls.
 - **CI workflow** (`.github/workflows/ci.yml`): runs pytest, py_compile, sanitize-check, and smoke-test on every push and pull request (windows-latest).
 - **Issue templates**: bug report and feature request templates with environment fields.
 - **`.gitattributes`**: line-ending normalization — CRLF for `.ps1`/`.ahk`/`.cmd`, LF for `.py`/`.json`/`.md`, binary for assets.
