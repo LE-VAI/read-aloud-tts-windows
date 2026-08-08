@@ -165,9 +165,26 @@ def sanitize_text(text: str) -> str:
     return "".join(cleaned)
 
 
-def chunk_text(text: str, chunk_chars: int) -> list[str]:
+def chunk_text(text: str, chunk_chars: int, first_chunk_chars: int = 0) -> list[str]:
+    """Split text into chunks for pipelined synthesis.
+
+    Args:
+        text: Normalized text to chunk.
+        chunk_chars: Maximum characters per chunk for chunks 1+.
+        first_chunk_chars: If > 0, the first chunk is capped at this size
+            so audio starts quickly (chunk 0 is synthesized synchronously
+            before playback begins, so a full 600-char chunk means 6-13s
+            of silence before the user hears anything). Subsequent chunks
+            pipeline (synth N+1 while N plays) so they can be full-size.
+    """
     paragraphs = [p.strip() for p in re.split(r"\n\s*\n", text) if p.strip()]
     chunks: list[str] = []
+
+    # When first_chunk_chars is set, we chunk in two passes: first pass
+    # accumulates only up to first_chunk_chars, then emits chunk 0; second
+    # pass accumulates the rest at full chunk_chars. This gives sub-2s
+    # audio start while keeping subsequent chunks efficient.
+    effective_limit = first_chunk_chars if (first_chunk_chars > 0 and not chunks) else chunk_chars
 
     # Accumulate paragraphs into the current chunk up to chunk_chars before
     # emitting. The old code emitted one chunk per paragraph (even short ones),
@@ -175,7 +192,10 @@ def chunk_text(text: str, chunk_chars: int) -> list[str]:
     # Merging short paragraphs cuts chunk count 3-5x for typical selections.
     current = ""
     for paragraph in paragraphs:
-        if len(current) + len(paragraph) + 2 <= chunk_chars:
+        # Use the smaller limit for the first chunk only.
+        effective_limit = first_chunk_chars if (first_chunk_chars > 0 and not chunks) else chunk_chars
+
+        if len(current) + len(paragraph) + 2 <= effective_limit:
             current = f"{current}\n\n{paragraph}" if current else paragraph
             continue
 
@@ -196,7 +216,9 @@ def chunk_text(text: str, chunk_chars: int) -> list[str]:
             sentence = sentence.strip()
             if not sentence:
                 continue
-            if len(current) + len(sentence) + 1 <= chunk_chars:
+            # Again, use the smaller limit for the first chunk.
+            effective_limit = first_chunk_chars if (first_chunk_chars > 0 and not chunks) else chunk_chars
+            if len(current) + len(sentence) + 1 <= effective_limit:
                 current = f"{current} {sentence}".strip() if current else sentence
                 continue
             if current:

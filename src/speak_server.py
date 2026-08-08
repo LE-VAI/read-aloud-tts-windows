@@ -356,6 +356,12 @@ def handle_speak(text: str, from_word: int = 0) -> dict[str, str]:
 
     max_chars = int(config.get("max_chars", 30000))
     chunk_chars = int(config.get("chunk_chars", 600))
+    # Fast-start: cap the first chunk at a smaller size so audio starts
+    # quickly. Chunk 0 is synthesized synchronously before playback, so
+    # a full 600-char chunk means 6-13s of silence before first audio
+    # (at length_scale=1.2). A 150-char first chunk = ~1-2 sentences =
+    # ~1-2s to first audio. Subsequent chunks pipeline at full size.
+    first_chunk_chars = int(config.get("first_chunk_chars", 150))
     text = normalize_text(text, max_chars)
     if not text:
         return {"status": "error", "message": "No text to speak"}
@@ -368,7 +374,7 @@ def handle_speak(text: str, from_word: int = 0) -> dict[str, str]:
         text = " ".join(words[from_word:])
         logging.info("Seeking from word %s, remaining: %s chars", from_word, len(text))
 
-    chunks = chunk_text(text, chunk_chars)
+    chunks = chunk_text(text, chunk_chars, first_chunk_chars=first_chunk_chars)
     sentence_silence = float(config.get("sentence_silence", 0.5))
     inter_chunk_pause = float(config.get("inter_chunk_pause", 0.3))
 
@@ -382,8 +388,8 @@ def handle_speak(text: str, from_word: int = 0) -> dict[str, str]:
 
     def synth_chunk(chunk_text: str) -> tuple[bytes, int, int]:
         # Rebuild syn_config per chunk so on-the-fly speed changes
-        # (Ctrl+=/Ctrl+-/Ctrl+0) take effect on the next chunk,
-        # not only on the next speak request.
+        # (Ctrl+Alt+[/Ctrl+Alt+]/Ctrl+Alt+\) take effect on the next
+        # chunk, not only on the next speak request.
         cfg = load_config()
         syn_cfg = _build_syn_config(cfg)
         return _synthesize_to_wav_bytes(voice, chunk_text, syn_cfg, sentence_silence)

@@ -4,14 +4,16 @@
 
 ### Added
 - **On-the-fly speed control** — adjust reading speed without restarting the daemon or reloading the voice model:
-  - `Ctrl+=` (or `Ctrl++`) = 10% faster
-  - `Ctrl+-` = 10% slower
-  - `Ctrl+0` = reset to normal (1.0×)
+  - `Ctrl+Alt+]` = 10% faster (borrows the VLC/mpv bracket-key convention)
+  - `Ctrl+Alt+[` = 10% slower
+  - `Ctrl+Alt+\` = reset to normal (1.0×)
+  - Uses `Ctrl+Alt+` prefix (same as `Ctrl+Alt+T` for transcript) to avoid conflicts with zoom (`Ctrl+/-`), browser tab-switching (`Ctrl+digit`), and text selection (`Shift+Home`). Per research: Thorium Reader solved the same zoom conflict with `Ctrl+5/6/7`, but that conflicts with browser tabs in a global-overlay app. `Ctrl+Alt+bracket` is essentially unbound in all reading apps.
   - Tray menu "Speed:" item shows current speed and cycles through presets (normal → 1.2× slower → 1.5× slower → 0.8× faster)
   - Speed changes take effect on the **next chunk** being synthesized (standard TTS behavior — audio already playing is not affected)
   - Persists to `config.json` (`length_scale` key), survives restarts
   - Range: 0.5 (2× faster) to 2.0 (2× slower), clamped to prevent artifacts at extremes
   - `handle_set_speed()` in `speak_server.py` sets a `_runtime_length_scale` override that `synth_chunk()` picks up per-chunk (rebuilds `SynthesisConfig` each call). Piper's `length_scale` is a per-call ONNX input, not a model property — zero cost to change between calls.
+- **Fast-start first chunk** — `first_chunk_chars` config option (default 150) caps the first chunk at a small size so audio starts in 1-2s instead of 6-13s. Chunk 0 is synthesized synchronously before playback begins, so a full 600-char chunk at `length_scale=1.2` meant 6-13s of silence before first audio. Subsequent chunks pipeline (synth N+1 while N plays) so they remain full-size (600 chars). `chunk_text()` in `speak.py` gained a `first_chunk_chars` parameter.
 - **CI workflow** (`.github/workflows/ci.yml`): runs pytest, py_compile, sanitize-check, and smoke-test on every push and pull request (windows-latest).
 - **Issue templates**: bug report and feature request templates with environment fields.
 - **`.gitattributes`**: line-ending normalization — CRLF for `.ps1`/`.ahk`/`.cmd`, LF for `.py`/`.json`/`.md`, binary for assets.
@@ -24,6 +26,7 @@
 - **`speak.py --serve`** path simplified: removed redundant piper pre-flight (now handled by `speak_server.serve()` via `_ensure_piper()`).
 - **Hotkeys now use `$*` prefix** in `ReadAloudTTS.ahk`: `$` forces AHK's low-level keyboard hook (instead of RegisterHotkey, which Electron apps like ZCode/VS Code override at the window-proc level — Home was eaten before AHK saw it), `*` fires regardless of modifier state. Fixes "TTS works in browser but not in ZCode."
 - **Tuned ONNX Runtime session** in `speak_server.py _load_voice()`: replaces the bare default `InferenceSession` that `PiperVoice.load()` creates with one carrying `intra_op_num_threads=1`, `graph_optimization_level=ORT_ENABLE_ALL`, `allow_spinning=1`, `spin_duration_us=1000`, `spin_backoff_max=8`. Per ORT maintainer tlh20 in microsoft/onnxruntime#7449, `intra_op_num_threads=1` eliminates the intra-op thread pool entirely (no worker threads to park = no wake cost). Verified over 3 days: warm/recent-read latency dropped from 8-13s to sub-second (0.1-0.9s); long-idle (hours) latency dropped from 12-13s to 4-7s (residual is CPU C-states, not ORT).
+- **Naturalness defaults tuned**: `sentence_silence` 0.5 → 0.75s (longer pauses between sentences — community consensus for narration), `length_scale` 1.0 → 1.2 (narration pace instead of voice-assistant pace). Both are config values, instantly adjustable via speed hotkeys.
 
 ## 0.7.2 - Playback truncation fix and AI-tool copy compatibility
 
