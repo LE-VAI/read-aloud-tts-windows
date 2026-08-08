@@ -4,11 +4,10 @@
 
 ### Added
 - **On-the-fly speed control** — adjust reading speed without restarting the daemon or reloading the voice model:
-  - `Ctrl+Alt+]` = 10% faster (borrows the VLC/mpv bracket-key convention)
-  - `Ctrl+Alt+[` = 10% slower
-  - `Ctrl+Alt+\` = reset to normal (1.0×)
-  - Uses `Ctrl+Alt+` prefix (same as `Ctrl+Alt+T` for transcript) to avoid conflicts with zoom (`Ctrl+/-`), browser tab-switching (`Ctrl+digit`), and text selection (`Shift+Home`). Per research: Thorium Reader solved the same zoom conflict with `Ctrl+5/6/7`, but that conflicts with browser tabs in a global-overlay app. `Ctrl+Alt+bracket` is essentially unbound in all reading apps.
-  - Tray menu "Speed:" item shows current speed and cycles through presets (normal → 1.2× slower → 1.5× slower → 0.8× faster)
+  - `Ctrl+*` (`Ctrl+Shift+8`) = 10% faster (`*` = multiply = more speed mnemonic)
+  - `Ctrl+/` = 10% slower (`/` = divide = less speed mnemonic)
+  - Tray menu "Speed:" item shows current speed and cycles through presets (normal → 1.2× slower → 1.5× slower → 0.8× faster) to reset
+  - Avoids zoom conflict (`Ctrl+/-`) and works on compact keyboards (Logitech MX Keys) without Alt or numpad — `*` is `Shift+8`, `/` is its own key
   - Speed changes take effect on the **next chunk** being synthesized (standard TTS behavior — audio already playing is not affected)
   - Persists to `config.json` (`length_scale` key), survives restarts
   - Range: 0.5 (2× faster) to 2.0 (2× slower), clamped to prevent artifacts at extremes

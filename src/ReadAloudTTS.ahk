@@ -51,16 +51,13 @@ $*F6::StopSpeech()
 $*^!t::ShowTranscript()
 
 ; Speed control — on-the-fly rate adjustment.
-;   Ctrl+Alt+] = faster  (borrows the VLC/mpv bracket convention)
-;   Ctrl+Alt+[ = slower
-;   Ctrl+Alt+\ = reset to normal (1.0)
-; Uses Ctrl+Alt+ prefix (same as Ctrl+Alt+T for transcript) to avoid
-; conflicts with zoom (Ctrl+/-) and browser tab-switching (Ctrl+digit).
+;   Ctrl + * (Ctrl+Shift+8) = faster  (multiply = more speed)
+;   Ctrl + /                = slower  (divide = less speed)
+; Tray menu "Speed:" item cycles presets and resets to normal.
 ; Takes effect on the next chunk being synthesized, not the currently
 ; playing one. Persists to config.json so it survives restarts.
-$*^!]::AdjustSpeed(0.9)
-$*^![::AdjustSpeed(1.1)
-$*^!\::ResetSpeed()
+$*^+8::AdjustSpeed(0.9)
+$*^/::AdjustSpeed(1.1)
 
 StartDaemon()
 
@@ -217,11 +214,11 @@ GetSpeedLabel() {
     speed := GetCurrentSpeed()
     if (speed < 1.0) {
         mult := 1.0 / speed
-        return Round(mult, 1) . "x faster (Ctrl+Alt+[/])"
+        return Round(mult, 1) . "x faster (Ctrl+*/)"
     } else if (speed > 1.0) {
-        return Round(speed, 1) . "x slower (Ctrl+Alt+[/])"
+        return Round(speed, 1) . "x slower (Ctrl+*/)"
     } else {
-        return "Normal (Ctrl+Alt+[/])"
+        return "Normal (Ctrl+*/)"
     }
 }
 
