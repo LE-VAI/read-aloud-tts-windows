@@ -21,7 +21,7 @@ CONFIG_PATH = APP_DIR / "config.json"
 LOG_PATH = APP_DIR / "logs" / "readaloud.log"
 TMP_DIR = APP_DIR / "tmp"
 PIPER_TIMEOUT_SECONDS = 90
-VERSION = "0.7.2"
+VERSION = "0.8.0"
 UNICODE_REPLACEMENTS = str.maketrans(
     {
         "\u2018": "'",
@@ -70,11 +70,11 @@ def _default_config() -> dict[str, Any]:
         "max_chars": 30000,
         "chunk_chars": 600,
         "first_chunk_chars": 150,
-        "sentence_silence": 0.75,
-        "inter_chunk_pause": 0.3,
+        "sentence_silence": 0.4,
+        "inter_chunk_pause": 0.25,
         "length_scale": 1.2,
-        "noise_scale": 0.667,
-        "noise_w": 0.8,
+        "noise_scale": 0.4,
+        "noise_w": 0.3,
         "voices": {},
     }
 
@@ -133,6 +133,7 @@ def cleanup_stale_temp_audio(current_run_dir: Path | None = None) -> None:
 
 
 def normalize_text(text: str, max_chars: int) -> str:
+    text = normalize_markdown(text)
     text = sanitize_text(text)
     text = text.replace("\r\n", "\n").replace("\r", "\n")
     text = re.sub(r"[ \t]+", " ", text)
@@ -141,6 +142,155 @@ def normalize_text(text: str, max_chars: int) -> str:
     if len(text) > max_chars:
         text = text[:max_chars].rstrip() + "..."
     return text
+
+
+def normalize_markdown(text: str) -> str:
+    """Convert markdown structures to speech-friendly flowing text.
+
+    Piper TTS synthesizes each sentence in isolation (VITS is
+    non-autoregressive). When it receives a markdown table like:
+
+      | Cause | Fix |
+      |---|---|
+      | No trailing silence. | Append 0.3s silence. |
+
+    espeak-ng treats each cell as a separate "sentence", so Piper produces
+    "Cause" [0.4s gap] "Fix" [0.4s gap] "No trailing silence." — short
+    fragments with long gaps, jumpy and unnatural. The fix is to convert
+    the table structure into descriptive flowing sentences BEFORE sending
+    to Piper, so each row becomes a natural clause with the column
+    headers as context.
+
+    This also strips other markdown formatting that confuses espeak-ng:
+    bold (**text**), italic (*text*), inline code (`code`), heading
+    hashes (#), and bullet/list markers (-, *, 1.).
+    """
+    lines = text.split("\n")
+
+    # Detect and convert markdown tables to flowing prose.
+    lines = _convert_markdown_tables(lines)
+
+    text = "\n".join(lines)
+
+    # Strip inline formatting that espeak-ng can't parse.
+    # Bold: **text** or __text__ -> text
+    text = re.sub(r"\*\*(.+?)\*\*", r"\1", text)
+    text = re.sub(r"__(.+?)__", r"\1", text)
+    # Italic: *text* or _text_ -> text (avoid matching ** which is bold)
+    text = re.sub(r"(?<!\*)\*(?!\*)\b(.+?)\b\*(?!\*)", r"\1", text)
+    text = re.sub(r"(?<!\w)_(?!_)(.+?)_(?!_)", r"\1", text)
+    # Inline code: `text` -> text
+    text = re.sub(r"`([^`]+)`", r"\1", text)
+    # Links: [text](url) -> text
+    text = re.sub(r"\[([^\]]+)\]\([^)]+\)", r"\1", text)
+    # Images: ![alt](url) -> alt
+    text = re.sub(r"!\[([^\]]*)\]\([^)]+\)", r"\1", text)
+    # Headings: # Heading -> Heading (strip leading hashes + space)
+    text = re.sub(r"^#{1,6}\s+", "", text, flags=re.MULTILINE)
+    # Horizontal rules: --- or *** or ___ on its own line -> remove
+    text = re.sub(r"^(?:-{3,}|\*{3,}|_{3,})\s*$", "", text, flags=re.MULTILINE)
+    # Bullet lists: "- item" or "* item" -> "item"
+    text = re.sub(r"^\s*[-*+]\s+", "", text, flags=re.MULTILINE)
+    # Numbered lists: "1. item" -> "First, item"  "2. item" -> "Second, item"
+    ordinals = ["First", "Second", "Third", "Fourth", "Fifth",
+                "Sixth", "Seventh", "Eighth", "Ninth", "Tenth"]
+    def _numbered_repl(match: re.Match) -> str:
+        num = int(match.group(1))
+        if 1 <= num <= len(ordinals):
+            return f"{ordinals[num - 1]}, "
+        return f"Number {num}, "
+    text = re.sub(r"^\s*(\d+)\.\s+", _numbered_repl, text, flags=re.MULTILINE)
+    # Blockquotes: "> text" -> "text"
+    text = re.sub(r"^\s*>\s+", "", text, flags=re.MULTILINE)
+
+    # Clean up any leftover pipe characters from imperfect table parsing
+    # or pipe-as-or usage (keep them — sanitize_text handles | below)
+    return text
+
+
+def _convert_markdown_tables(lines: list[str]) -> list[str]:
+    """Detect markdown tables and convert them to flowing prose.
+
+    A markdown table is a sequence of consecutive lines where:
+    - Line 0 has pipe-delimited cells: | a | b |
+    - Line 1 is a separator: |---|---|
+    - Lines 2+ are data rows: | val | val |
+
+    Conversion pattern (row-walking with context):
+      "Table with columns: Cause, Fix. Cause: no trailing silence. Fix: append 0.3s."
+
+    This gives Piper full sentence context so it produces natural
+    prosody instead of isolated cell fragments.
+    """
+    result: list[str] = []
+    i = 0
+    while i < len(lines):
+        line = lines[i]
+        stripped = line.strip()
+
+        # Check if this line looks like a table header row.
+        if "|" in stripped and stripped.startswith("|"):
+            # Look ahead for a separator line.
+            if i + 1 < len(lines) and re.match(
+                r"\s*\|[\s\-:|]+\|\s*$", lines[i + 1].strip()
+            ):
+                # Collect the full table.
+                table_lines = [stripped]
+                j = i + 2  # skip header + separator
+                while j < len(lines) and "|" in lines[j].strip() and lines[j].strip().startswith("|"):
+                    table_lines.append(lines[j].strip())
+                    j += 1
+
+                # Parse the table.
+                header_cells = _parse_table_row(table_lines[0])
+                # table_lines[0] is the header, table_lines[1:] are data rows
+                # (the separator line was NOT included in table_lines — it was
+                # skipped by the j = i + 2 lookahead).
+                data_rows = [_parse_table_row(row) for row in table_lines[1:]]
+
+                # Convert to flowing prose.
+                prose_parts: list[str] = []
+                if header_cells:
+                    headers = ", ".join(h for h in header_cells if h)
+                    if headers:
+                        prose_parts.append(f"Table with columns: {headers}.")
+
+                for row in data_rows:
+                    if not row or all(not c for c in row):
+                        continue
+                    # Pair each cell with its column header.
+                    parts: list[str] = []
+                    for ci, cell in enumerate(row):
+                        if not cell:
+                            continue
+                        if ci < len(header_cells) and header_cells[ci]:
+                            parts.append(f"{header_cells[ci]}: {cell}")
+                        else:
+                            parts.append(cell)
+                    if parts:
+                        prose_parts.append(". ".join(parts) + ".")
+
+                if prose_parts:
+                    result.append("  ".join(prose_parts))
+
+                i = j  # skip past the entire table
+                continue
+
+        result.append(line)
+        i += 1
+
+    return result
+
+
+def _parse_table_row(line: str) -> list[str]:
+    """Extract cell values from a markdown table row like '| a | b |'."""
+    # Remove leading/trailing pipes, split on |, strip each cell.
+    inner = line.strip()
+    if inner.startswith("|"):
+        inner = inner[1:]
+    if inner.endswith("|"):
+        inner = inner[:-1]
+    return [cell.strip() for cell in inner.split("|")]
 
 
 def sanitize_text(text: str) -> str:

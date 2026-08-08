@@ -3,11 +3,11 @@
   "max_chars": 30000,
   "chunk_chars": 600,
   "first_chunk_chars": 150,
-  "sentence_silence": 0.75,
-  "inter_chunk_pause": 0.3,
+  "sentence_silence": 0.4,
+  "inter_chunk_pause": 0.25,
   "length_scale": 1.2,
-  "noise_scale": 0.667,
-  "noise_w": 0.8,
+  "noise_scale": 0.4,
+  "noise_w": 0.3,
   "voices": {
     "en_US-lessac-medium": {
       "label": "Lessac - warm",

@@ -118,11 +118,11 @@ After install, `config.json` (in the app folder, copied from `config.example.jso
 | Key | Default | Effect |
 | --- | --- | --- |
 | `chunk_chars` | `600` | Maximum characters per Piper invocation. Lower values = faster first audio; higher = fewer chunks (fewer cold starts). |
-| `sentence_silence` | `0.5` | Seconds of silence Piper inserts after each sentence. Increase for more breathing room; decrease for faster delivery. |
-| `inter_chunk_pause` | `0.3` | Seconds of silence between chunk playbacks. Prevents abrupt merges at chunk boundaries. |
-| `length_scale` | `1.0` | Overall speech speed. `1.0` = natural, `0.8` = slower/clearer, `1.2` = faster. |
-| `noise_scale` | `0.667` | Pitch/prosody variation. Higher = more expressive intonation; lower = flatter. |
-| `noise_w` | `0.8` | Phoneme duration jitter. Higher = more human-like rhythmic irregularity; lower = steadier cadence. |
+| `sentence_silence` | `0.4` | Seconds of silence Piper inserts after each sentence. 0.4s is close to natural speech pauses; increase for more breathing room, decrease for faster delivery. |
+| `inter_chunk_pause` | `0.25` | Seconds of silence between chunk playbacks. Prevents abrupt merges at chunk boundaries. |
+| `length_scale` | `1.2` | Overall speech speed. `1.0` = natural, `0.8` = slower/clearer, `1.5` = much slower, `0.5` = 2× faster. |
+| `noise_scale` | `0.4` | Pitch/prosody variation. Higher = more expressive intonation; lower = flatter. 0.4 reduces random "weird inflections" while staying natural. |
+| `noise_w` | `0.3` | Phoneme duration jitter. Higher = more rhythmic irregularity (can cause random mid-phrase pauses); lower = steadier cadence. 0.3 eliminates spurious pauses within phrases like "all but the last". |
 
 If a key is absent from `config.json`, the voice model's built-in defaults are used.
 

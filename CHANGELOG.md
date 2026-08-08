@@ -1,5 +1,28 @@
 # Changelog
 
+## Unreleased - Naturality pass
+
+### Added
+- **Markdown-to-speech normalizer** (`normalize_markdown()` in `speak.py`) — converts markdown formatting to speech-friendly flowing text before Piper sees it. Piper (VITS) synthesizes each sentence in isolation, so markdown tables produce isolated cell fragments with 0.4s gaps between them — "Cause" [gap] "Fix" [gap] "value..." — jumpy and unnatural. The normalizer:
+  - **Tables → flowing prose**: `| Cause | Fix |` rows become "Table with columns: Cause, Fix. Cause: no trailing silence. Fix: append 0.3s." — gives Piper full sentence context with column headers as anchors.
+  - **Bold/italic stripped**: `**bold**` and `*italic*` → plain text (espeak-ng can't parse markdown emphasis).
+  - **Inline code stripped**: `` `code` `` → plain text.
+  - **Links → text**: `[text](url)` → just the link text.
+  - **Headings stripped**: `# Heading` → `Heading` (hashes confuse espeak-ng).
+  - **Bullets stripped**: `- item` → `item`.
+  - **Numbered lists → ordinals**: `1.` → `First,`, `2.` → `Second,`, etc. (more natural than "one dot").
+  - **Blockquotes stripped**: `> quote` → `quote`.
+  - **Horizontal rules removed**: `---` lines deleted (they create pauses without content).
+- **Tests for markdown normalization** — 16 new tests in `test_speak.py` covering table conversion, bold/italic/code stripping, headings, links, bullets, numbered lists, blockquotes, mixed content, and integration with `normalize_text()`.
+
+### Changed
+- **Prosody parameters tuned for naturality** — three parameters adjusted based on research into VITS stochastic duration predictor behavior:
+  - `noise_w` 0.8 → 0.3 — controls phoneme duration variation. At 0.8, the VITS stochastic duration predictor randomly stretches phonemes, creating perceived pauses at arbitrary points within phrases (e.g., "all... but the last" instead of "all but the last"). At 0.3, durations are more uniform, eliminating spurious mid-phrase pauses. Below 0.3 starts to sound robotic.
+  - `noise_scale` 0.667 → 0.4 — controls pitch/prosody randomness. At 0.667, random pitch inflections ("weird inflections") occur. At 0.4, pitch is more controlled while still natural. Below 0.3 is too monotone.
+  - `sentence_silence` 0.75 → 0.4 — the inter-sentence gap. 0.75s was unusually high (Piper default is 0.2s); it created long gaps after every sentence, contributing to the "jumpy" feel when reading structured content. 0.4s is closer to natural speech pauses.
+  - `inter_chunk_pause` 0.3 → 0.25 — slightly tighter chunk transitions.
+- **Version bumped** to 0.8.0.
+
 ## Unreleased - Quality and stability pass
 
 ### Added
@@ -34,7 +57,7 @@
 - **`speak.py --serve`** path simplified: removed redundant piper pre-flight (now handled by `speak_server.serve()` via `_ensure_piper()`).
 - **Hotkeys now use `$*` prefix** in `ReadAloudTTS.ahk`: `$` forces AHK's low-level keyboard hook (instead of RegisterHotkey, which Electron apps like ZCode/VS Code override at the window-proc level — Home was eaten before AHK saw it), `*` fires regardless of modifier state. Fixes "TTS works in browser but not in ZCode."
 - **Tuned ONNX Runtime session** in `speak_server.py _load_voice()`: replaces the bare default `InferenceSession` that `PiperVoice.load()` creates with one carrying `intra_op_num_threads=1`, `graph_optimization_level=ORT_ENABLE_ALL`, `allow_spinning=1`, `spin_duration_us=1000`, `spin_backoff_max=8`. Per ORT maintainer tlh20 in microsoft/onnxruntime#7449, `intra_op_num_threads=1` eliminates the intra-op thread pool entirely (no worker threads to park = no wake cost). Verified over 3 days: warm/recent-read latency dropped from 8-13s to sub-second (0.1-0.9s); long-idle (hours) latency dropped from 12-13s to 4-7s (residual is CPU C-states, not ORT).
-- **Naturalness defaults tuned**: `sentence_silence` 0.5 → 0.75s (longer pauses between sentences — community consensus for narration), `length_scale` 1.0 → 1.2 (narration pace instead of voice-assistant pace). Both are config values, instantly adjustable via speed hotkeys.
+- **Naturalness defaults introduced**: `sentence_silence` 0.5 → 0.75s, `length_scale` 1.0 → 1.2 (narration pace). Both are config values, instantly adjustable via speed hotkeys. (Note: `sentence_silence` was later reduced to 0.4s in the naturality pass — see above.)
 
 ## 0.7.2 - Playback truncation fix and AI-tool copy compatibility
 
