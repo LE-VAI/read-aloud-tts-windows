@@ -158,6 +158,11 @@ $shortcut.TargetPath = $ahkExe
 $shortcut.Arguments = "`"$(Join-Path $InstallDir "ReadAloudTTS.ahk")`""
 $shortcut.WorkingDirectory = $InstallDir
 $shortcut.Description = "Read selected text aloud with local Piper TTS"
+$iconSource = Join-Path $PSScriptRoot "docs\assets\app.ico"
+if (Test-Path $iconSource) {
+    Copy-Item $iconSource (Join-Path $InstallDir "app.ico") -Force
+    $shortcut.IconLocation = Join-Path $InstallDir "app.ico"
+}
 $shortcut.Save()
 Write-Host "Startup shortcut: $shortcutPath"
 

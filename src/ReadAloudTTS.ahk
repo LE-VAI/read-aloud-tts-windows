@@ -33,6 +33,12 @@ global gLastMouseX := 0
 global gLastMouseY := 0
 
 DirCreate TempDir
+; Brand the tray — without this the taskbar shows AutoHotkey's generic icon.
+; Graceful fallback: missing file just keeps the default icon.
+if FileExist(AppDir . "\app.ico") {
+    TraySetIcon(AppDir . "\app.ico")
+}
+A_IconTip := "ReadAloudTTS — select text, press Home"
 ; Don't blindly delete the readiness marker — if a daemon from a previous
 ; session is still alive (holding the single-instance mutex), deleting the
 ; marker orphans it and every subsequent Home press silently fails. Ping

@@ -1,5 +1,9 @@
 # ReadAloudTTS for Windows
 
+[![CI](https://github.com/LE-VAI/read-aloud-tts-windows/actions/workflows/ci.yml/badge.svg)](https://github.com/LE-VAI/read-aloud-tts-windows/actions/workflows/ci.yml)
+[![Release](https://img.shields.io/github/v/release/LE-VAI/read-aloud-tts-windows)](https://github.com/LE-VAI/read-aloud-tts-windows/releases/latest)
+[![License](https://img.shields.io/github/license/LE-VAI/read-aloud-tts-windows)](LICENSE)
+
 ![ReadAloudTTS hero](docs/assets/readme-hero.png)
 
 Offline Windows selected-text read-aloud helper using AutoHotkey and Piper TTS. Built for local utility: **select text, press `Home`, and hear it spoken instantly** — without sending a word to a cloud service.
