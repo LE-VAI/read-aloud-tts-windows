@@ -26,6 +26,11 @@ global HighlightCurrentIdx := -1
 global HighlightPaused := false
 global HighlightFullText := ""
 global TranscriptGui := ""
+; Last cursor position — used by HighlightTick to require mouse MOVEMENT
+; before hover-pause (prevents pause/resume flapping when the overlay
+; rebuilds under a resting cursor).
+global gLastMouseX := 0
+global gLastMouseY := 0
 
 DirCreate TempDir
 ; Don't blindly delete the readiness marker — if a daemon from a previous
@@ -193,6 +198,7 @@ InitTray() {
     A_TrayMenu.Add("Read Selection`tCtrl+Right-click", (*) => ReadSelection())
     A_TrayMenu.Add("Stop`tF6", (*) => StopSpeech())
     A_TrayMenu.Add("Speed: " . GetSpeedLabel(), (*) => CycleSpeed())
+    A_TrayMenu.Add("Word highlight box: " . (ShowOverlayEnabled() ? "On" : "Off"), ToggleOverlayFromTray)
     A_TrayMenu.Add()
 
     voiceMenu := Menu()
@@ -225,6 +231,12 @@ GetSpeedLabel() {
     } else {
         return "Normal (Ctrl+*/)"
     }
+}
+
+ToggleOverlayFromTray(*) {
+    nowOn := ToggleOverlayEnabled()
+    InitTray()
+    TrayTip (nowOn ? "Word highlight box enabled" : "Word highlight box disabled"), "ReadAloudTTS"
 }
 
 CycleSpeed(*) {
@@ -399,8 +411,10 @@ SpeakViaDaemon(text) {
     try FileDelete ResponsePath
     try FileDelete HighlightPath
     FileAppend req, RequestPath, "UTF-8"
-    ; Start the highlight overlay timer (polls highlight_state.json).
-    StartHighlightTimer()
+    ; Start the highlight overlay timer only when enabled (opt-in).
+    if ShowOverlayEnabled() {
+        StartHighlightTimer()
+    }
     ; Wait for the response (up to 120s for long text).
     WaitResponse(120)
 }
@@ -587,17 +601,26 @@ StopHighlightTimer() {
 }
 
 HighlightTick() {
-    global HighlightGui, HighlightPaused
+    global HighlightGui, HighlightPaused, gLastMouseX, gLastMouseY
     ; Hover-pause/resume via this 30ms poll — Gui has no MouseMove event in
-    ; AHK v2, so we compare the window under the cursor against the overlay.
-    if (HighlightGui != "") {
-        mouseOver := IsMouseOverOverlay()
-        if (mouseOver and !HighlightPaused) {
-            OverlayHoverPause()
-        } else if (!mouseOver and HighlightPaused) {
+    ; AHK v2. Resume works even when the overlay was torn down mid-pause
+    ; (stop-state handler destroys the GUI; position/paused survive now).
+    if (HighlightPaused) {
+        if !IsMouseOverOverlay() {
             OverlayMouseLeaveResume()
         }
+    } else if (HighlightGui != "") {
+        if IsMouseOverOverlay() {
+            ; Only pause on mouse MOVEMENT into the overlay. If the overlay
+            ; rebuilds (resume) directly under a resting cursor, pausing
+            ; immediately would flap pause/resume forever.
+            MouseGetPos &mx, &my
+            if (mx != gLastMouseX or my != gLastMouseY) {
+                OverlayHoverPause()
+            }
+        }
     }
+    MouseGetPos &gLastMouseX, &gLastMouseY
     if !FileExist(HighlightPath) {
         return
     }
@@ -685,6 +708,33 @@ HighlightOnStop() {
 
 ; --- Overlay GUI ---
 
+ShowOverlayEnabled() {
+    global ConfigPath
+    try {
+        content := FileRead(ConfigPath, "UTF-8")
+        if RegExMatch(content, '"highlight_overlay"\s*:\s*(true|false)', &m) {
+            return (m[1] = "true")
+        }
+    }
+    return false  ; Opt-in by default — the box annoyed the user.
+}
+
+ToggleOverlayEnabled() {
+    global ConfigPath
+    newVal := ShowOverlayEnabled() ? "false" : "true"
+    try {
+        content := FileRead(ConfigPath, "UTF-8")
+        if RegExMatch(content, '"highlight_overlay"\s*:') {
+            content := RegExReplace(content, '"highlight_overlay"\s*:\s*(true|false)', '"highlight_overlay": ' . newVal)
+        } else {
+            content := RegExReplace(content, '\{', '{' . Q . 'highlight_overlay' . Q . ': ' . newVal . ', ', , 1)
+        }
+        FileDelete ConfigPath
+        FileAppend content, ConfigPath, "UTF-8"
+    }
+    return ShowOverlayEnabled()
+}
+
 ShowHighlightOverlay(text) {
     global HighlightGui, HighlightFullText
     HideHighlightOverlay()
@@ -704,7 +754,10 @@ ShowHighlightOverlay(text) {
     HighlightGui.MarginX := 16
     HighlightGui.MarginY := 12
     ; -E0x200 removes WS_EX_TRANSPARENT from the Edit control too.
-    editCtrl := HighlightGui.Add("Edit", "w" . (panelWidth - 32) . " h" . (panelHeight - 24) . " -VScroll cWhite Background1a1a2e", text)
+    ; +0x100 = ES_NOHIDESEL: keep the selection VISIBLE when the control
+    ; doesn't have focus. The window is WS_EX_NOACTIVATE and never takes
+    ; focus, so without this style EM_SETSEL ran every 30ms invisibly.
+    editCtrl := HighlightGui.Add("Edit", "w" . (panelWidth - 32) . " h" . (panelHeight - 24) . " -VScroll +0x100 cWhite Background1a1a2e", text)
     ; NOTE: hover-pause is implemented by polling IsMouseOverOverlay() in
     ; HighlightTick — Gui.OnEvent("MouseMove", ...) is INVALID in AHK v2
     ; (valid events are Close/Escape/Size/ContextMenu/DropFiles) and threw
@@ -727,10 +780,12 @@ OverlayHoverPause(*) {
 }
 
 OverlayMouseLeaveResume(*) {
-    global HighlightPaused, HighlightGui, HighlightCurrentIdx
-    if (HighlightGui = "" or !HighlightPaused) {
+    global HighlightPaused, HighlightCurrentIdx
+    if (!HighlightPaused) {
         return
     }
+    ; NOTE: no HighlightGui check here — hover-pause may have torn the
+    ; overlay down (stop-state handler); resume must fire regardless.
     HighlightPaused := false
     ; Resume from the current word index.
     if (HighlightCurrentIdx >= 0) {
@@ -794,8 +849,10 @@ SeekFromWord(idx) {
     jsonText := JsonEscape(HighlightFullText)
     req := '{"action":"speak","text":"' . jsonText . '","from_word":' . idx . '}'
     FileAppend req, RequestPath, "UTF-8"
-    ; Restart the highlight timer.
-    StartHighlightTimer()
+    ; Restart the highlight timer (only when the overlay is enabled).
+    if ShowOverlayEnabled() {
+        StartHighlightTimer()
+    }
 }
 
 StopSpeechDaemon() {
@@ -842,8 +899,13 @@ HideHighlightOverlay() {
         try HighlightGui.Destroy()
         HighlightGui := ""
     }
-    HighlightPaused := false
-    HighlightCurrentIdx := -1
+    ; Preserve pause/position when a hover-pause teardown lands here —
+    ; wiping them made mouse-leave resume impossible (the resume branch
+    ; requires HighlightPaused=true and idx>=0), killing speech until the
+    ; next Home press. Only reset for genuine final stops.
+    if (!HighlightPaused) {
+        HighlightCurrentIdx := -1
+    }
 }
 
 ; ---------------------------------------------------------------------------
