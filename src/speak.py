@@ -21,7 +21,7 @@ CONFIG_PATH = APP_DIR / "config.json"
 LOG_PATH = APP_DIR / "logs" / "readaloud.log"
 TMP_DIR = APP_DIR / "tmp"
 PIPER_TIMEOUT_SECONDS = 90
-VERSION = "0.8.0"
+VERSION = "0.8.1"
 UNICODE_REPLACEMENTS = str.maketrans(
     {
         "\u2018": "'",
@@ -140,8 +140,102 @@ def normalize_text(text: str, max_chars: int) -> str:
     text = re.sub(r"\n{3,}", "\n\n", text)
     text = text.strip()
     if len(text) > max_chars:
-        text = text[:max_chars].rstrip() + "..."
+        text = _truncate_at_sentence(text, max_chars)
     return text
+
+
+def _truncate_at_sentence(text: str, max_chars: int) -> str:
+    """Truncate to max_chars at a sentence boundary when one exists nearby.
+
+    The old behavior cut mid-word and appended "...", so the reading ended
+    on a random fragment. Cutting at the last sentence end within the
+    budget (falling back to the last word boundary, then the hard cut)
+    ends the reading on a complete thought.
+    """
+    window = text[:max_chars]
+    # Last sentence-ending punctuation followed by whitespace, searched
+    # from the END of the window so the truncation keeps as much as fits.
+    sentence_end = None
+    for match in re.finditer(r"[.!?][\"')\]]?\s+", window):
+        sentence_end = match.end()
+    if sentence_end and sentence_end > max_chars * 0.5:
+        return window[:sentence_end].rstrip() + "..."
+    # No sentence boundary in the back half — cut at a word boundary.
+    word_end = window.rfind(" ")
+    if word_end > max_chars * 0.5:
+        return window[:word_end].rstrip() + "..."
+    return window.rstrip() + "..."
+
+
+def _decode_html_entities(text: str) -> str:
+    """Decode common HTML entities that survive clipboard copies from web pages.
+
+    Selected text rendered from HTML sometimes carries raw entities
+    (&amp;, &lt;, &#39;). espeak-ng reads them literally ("amp semi"),
+    which sounds like garbage words mid-sentence.
+    """
+    entities = {
+        "&amp;": "&",
+        "&lt;": "<",
+        "&gt;": ">",
+        "&quot;": '"',
+        "&#39;": "'",
+        "&apos;": "'",
+        "&nbsp;": " ",
+        "&mdash;": " — ",
+        "&ndash;": "-",
+        "&hellip;": "...",
+        "&rsquo;": "'",
+        "&lsquo;": "'",
+        "&ldquo;": '"',
+        "&rdquo;": '"',
+    }
+    for entity, replacement in entities.items():
+        text = text.replace(entity, replacement)
+    # Numeric entities: &#8217; etc.
+    text = re.sub(
+        r"&#(\d+);",
+        lambda m: chr(int(m.group(1))) if int(m.group(1)) < 0x11000 else " ",
+        text,
+    )
+    return text
+
+
+def _simplify_urls(text: str) -> str:
+    """Replace bare URLs with just the domain so they read naturally.
+
+    espeak-ng spells "https://github.com/user/repo" character by character
+    ("h t t p s colon slash slash..."). Reading only the registrable domain
+    ("github.com") preserves the reference without the noise.
+    """
+    def _url_repl(match: re.Match) -> str:
+        url = match.group(0)
+        rest = url.split("://", 1)[1] if "://" in url else url
+        domain = rest.split("/", 1)[0]
+        # Strip credentials and port for cleaner speech.
+        domain = domain.split("@")[-1].split(":")[0]
+        # "www." reads as "double-u double-u double-u dot" — pure noise.
+        if domain.lower().startswith("www."):
+            domain = domain[4:]
+        return domain if domain else ""
+
+    return re.sub(r"\bhttps?://\S+|\bwww\.\S+", _url_repl, text)
+
+
+def _strip_fenced_code(text: str) -> str:
+    """Remove fenced code blocks (```...```) and their content.
+
+    Reading source code aloud is noise for prose reading — identifiers,
+    punctuation, and symbols produce garbage phonemes. The fence lines and
+    the code between them are dropped entirely. An inline marker keeps the
+    listener aware something was skipped.
+    """
+    return re.sub(
+        r"```[^\n]*\n.*?```",
+        " (code block) ",
+        text,
+        flags=re.DOTALL,
+    )
 
 
 def normalize_markdown(text: str) -> str:
@@ -165,6 +259,15 @@ def normalize_markdown(text: str) -> str:
     bold (**text**), italic (*text*), inline code (`code`), heading
     hashes (#), and bullet/list markers (-, *, 1.).
     """
+    # Fenced code blocks first — their content must not survive into the
+    # inline-formatting passes (a ``` fence line would otherwise be read
+    # as stray backticks and the code as garbled symbols).
+    text = _strip_fenced_code(text)
+    # HTML entities from web-page clipboard copies.
+    text = _decode_html_entities(text)
+    # Bare URLs -> domain only.
+    text = _simplify_urls(text)
+
     lines = text.split("\n")
 
     # Detect and convert markdown tables to flowing prose.
@@ -193,7 +296,9 @@ def normalize_markdown(text: str) -> str:
     text = re.sub(r"^\s*[-*+]\s+", "", text, flags=re.MULTILINE)
     # Numbered lists: "1. item" -> "First, item"  "2. item" -> "Second, item"
     ordinals = ["First", "Second", "Third", "Fourth", "Fifth",
-                "Sixth", "Seventh", "Eighth", "Ninth", "Tenth"]
+                "Sixth", "Seventh", "Eighth", "Ninth", "Tenth",
+                "Eleventh", "Twelfth", "Thirteenth", "Fourteenth", "Fifteenth",
+                "Sixteenth", "Seventeenth", "Eighteenth", "Nineteenth", "Twentieth"]
     def _numbered_repl(match: re.Match) -> str:
         num = int(match.group(1))
         if 1 <= num <= len(ordinals):

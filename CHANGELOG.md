@@ -1,5 +1,19 @@
 # Changelog
 
+## Unreleased - Audit fixes (0.8.1)
+
+### Added
+- **Word-highlight overlay revived** — the pipelined-playback rewrite silently dropped the `start`/`playing` highlight-state writes, so the overlay GUI, hover-pause, and click-to-rewind never appeared (dead code since 0.7.1). The daemon now writes `{"state":"start",...}` before chunk 0 plays and `{"state":"playing","ms":...}` every ~30 ms during playback; when a later chunk finishes synthesizing mid-playback, the payload includes the grown `words` array so the overlay can highlight ahead. The AHK side re-parses timings whenever a larger words array arrives.
+- **Fenced code blocks silenced** — ```` ```lang ... ``` ```` blocks are replaced with "(code block)" instead of reading source symbols aloud.
+- **HTML entity decoding** — clipboard copies from web pages carrying `&amp;`, `&lt;`, `&#39;`, `&mdash;`, etc. (plus numeric entities) are decoded before synthesis instead of being read literally ("amp semi").
+- **Bare URLs simplified** — `https://github.com/user/repo` now reads as "github.com" (scheme, path, credentials, port, and `www.` stripped) instead of character-by-character spelling.
+- **Sentence-boundary truncation** — text over `max_chars` is cut at the last sentence end within budget (word-boundary fallback), not mid-word.
+
+### Fixed
+- **Tray "Stop" tooltip** said `Ctrl+Alt+Space`; the actual stop hotkey has been `F6` for several releases.
+- **Transcript window scrollbar** was explicitly disabled (`-VScroll`) despite the control being documented as scrollable; long transcripts can now be scrolled (`+VScroll`).
+- Numbered-list ordinals extended from 10 to 20 (Eleventh…Twentieth); beyond that falls back to "Number N,".
+
 ## Unreleased - Naturality pass
 
 ### Added

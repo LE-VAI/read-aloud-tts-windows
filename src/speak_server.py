@@ -428,6 +428,11 @@ def handle_speak(text: str, from_word: int = 0) -> dict[str, str]:
 
     all_word_timings: list[list] = []
     chunk_offset_ms = 0.0
+    # How many word timings the AHK overlay has already received via the
+    # highlight state file. Chunks synthesize progressively, so the words
+    # array grows during playback — the overlay re-parses whenever the
+    # payload includes it (see HighlightOnPlaying in ReadAloudTTS_WORKING.ahk).
+    written_words_count = -1
 
     # Shared pipeline state between the synth worker and the playback loop.
     # pending[ci] holds (wav_bytes, samples, sr, wtimings) once chunk ci is
@@ -504,6 +509,21 @@ def handle_speak(text: str, from_word: int = 0) -> dict[str, str]:
                 chunk_path.write_bytes(wav_bytes)
                 chunk_duration_s = (total_samples / sample_rate) if sample_rate else 1.0
 
+                # Announce playback start for the word-highlight overlay.
+                # The overlay GUI is only built when it receives a "start"
+                # state; without this write it never appears (regression
+                # from the pipelined-playback rewrite, which dropped the
+                # start/playing writes the original monolithic path had).
+                t_chunk_start = time.time()
+                if ci == 0:
+                    written_words_count = len(all_word_timings)
+                    _write_highlight_state({
+                        "state": "start",
+                        "text": text,
+                        "words": all_word_timings,
+                        "total_ms": round(chunk_offset_ms + chunk_duration_s * 1000.0),
+                    })
+
                 winsound.PlaySound(str(chunk_path), winsound.SND_FILENAME | winsound.SND_ASYNC)
                 if t_first_audio is None:
                     t_first_audio = time.time()
@@ -519,6 +539,19 @@ def handle_speak(text: str, from_word: int = 0) -> dict[str, str]:
                 # silence ensures the poll ending early only clips silence.
                 poll_end = time.time() + chunk_duration_s + 0.8
                 while not _stop_requested and time.time() < poll_end:
+                    elapsed_ms = chunk_offset_ms + (time.time() - t_chunk_start) * 1000.0
+                    if len(all_word_timings) != written_words_count:
+                        # New chunk synthesized while playing — send the grown
+                        # timings so the overlay can highlight ahead of audio.
+                        written_words_count = len(all_word_timings)
+                        _write_highlight_state({
+                            "state": "playing",
+                            "ms": round(elapsed_ms, 1),
+                            "text": text,
+                            "words": all_word_timings,
+                        })
+                    else:
+                        _write_highlight_state({"state": "playing", "ms": round(elapsed_ms, 1)})
                     time.sleep(0.03)
                 if _stop_requested:
                     winsound.PlaySound(None, 0)

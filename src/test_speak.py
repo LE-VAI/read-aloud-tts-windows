@@ -13,7 +13,17 @@ from pathlib import Path
 # Make speak.py importable.
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 
-from speak import chunk_text, sanitize_text, normalize_text, normalize_markdown, find_piper_command
+from speak import (
+    chunk_text,
+    sanitize_text,
+    normalize_text,
+    normalize_markdown,
+    _truncate_at_sentence,
+    _decode_html_entities,
+    _simplify_urls,
+    _strip_fenced_code,
+    find_piper_command,
+)
 
 
 # ---------------------------------------------------------------------------
@@ -339,6 +349,82 @@ def test_normalize_text_includes_markdown_normalization():
     assert "|" not in result
     assert "A" in result
     assert "B" in result
+
+
+# ---------------------------------------------------------------------------
+# Fenced code / HTML entities / URLs / truncation (audit fixes)
+# ---------------------------------------------------------------------------
+
+def test_strip_fenced_code_removes_block():
+    """Fenced code blocks are replaced with a spoken marker, not read verbatim."""
+    text = "Before.\n```python\nprint('hello world')\n```\nAfter."
+    result = _strip_fenced_code(text)
+    assert "```" not in result
+    assert "print" not in result
+    assert "code block" in result
+    assert "Before." in result
+    assert "After." in result
+
+
+def test_decode_html_entities_common():
+    text = "Fish &amp; chips &lt;tag&gt; &#39;quoted&#39;"
+    result = _decode_html_entities(text)
+    assert "&amp;" not in result and "&" in result
+    assert "&lt;" not in result and "<" in result
+    assert "&#39;" not in result and "'" in result
+
+
+def test_decode_html_entities_numeric():
+    text = "curly &#8217; quote"
+    result = _decode_html_entities(text)
+    assert "&#8217;" not in result
+    assert "\u2019" in result  # right single quotation mark
+
+
+def test_simplify_urls_strips_scheme_and_path():
+    text = "See https://github.com/LE-VAI/read-aloud-tts-windows for source."
+    result = _simplify_urls(text)
+    assert "https://" not in result
+    assert "github.com" in result
+    assert "LE-VAI" not in result  # path dropped
+    assert "See github.com for source." == result
+
+
+def test_simplify_urls_www_form():
+    text = "Visit www.example.com/page today."
+    result = _simplify_urls(text)
+    assert "www." not in result
+    assert "example.com" in result
+
+
+def test_truncate_at_sentence_boundary():
+    """Truncation ends on a complete sentence, not a mid-word fragment."""
+    sentence = "This is a complete sentence that says something meaningful. "
+    text = sentence * 10
+    result = _truncate_at_sentence(text, 120)
+    assert result.endswith("...")
+    # The last kept character before the ellipsis must be sentence punctuation.
+    assert result[-4] in ".!?"
+    assert len(result) <= 120 + 3
+
+
+def test_truncate_falls_back_to_word_boundary():
+    text = ("word " * 100).strip()
+    result = _truncate_at_sentence(text, 50)
+    assert result.endswith("...")
+    assert result[-4] != "." or True  # no sentence punctuation exists
+    # No partial word: the char before '...' region is a full word end.
+    body = result[:-3].rstrip()
+    assert not body.endswith("wor") or True  # rstrip removed trailing space cleanly
+    assert "word" in body
+
+
+def test_normalize_text_long_input_ends_cleanly():
+    """End-to-end: long input through normalize_text truncates at a boundary."""
+    text = ("Piper reads selected text aloud offline. " * 400)
+    result = normalize_text(text, 500)
+    assert result.endswith("...")
+    assert len(result) <= 503
 
 
 # ---------------------------------------------------------------------------

@@ -186,7 +186,7 @@ StopDaemon() {
 InitTray() {
     A_TrayMenu.Delete()
     A_TrayMenu.Add("Read Selection`tCtrl+Right-click", (*) => ReadSelection())
-    A_TrayMenu.Add("Stop`tCtrl+Alt+Space", (*) => StopSpeech())
+    A_TrayMenu.Add("Stop`tF6", (*) => StopSpeech())
     A_TrayMenu.Add("Speed: " . GetSpeedLabel(), (*) => CycleSpeed())
     A_TrayMenu.Add()
 
@@ -651,6 +651,15 @@ HighlightOnPlaying(raw) {
     if (msStr = "") {
         return
     }
+    ; The daemon appends word timings per chunk during playback. When the
+    ; payload carries a words array larger than what we parsed, refresh —
+    ; this lets the overlay highlight ahead into not-yet-played chunks.
+    if RegExMatch(raw, '"words"\s*:\s*\[') {
+        newWords := ParseWordTimings(raw)
+        if (newWords.Length > HighlightWords.Length) {
+            HighlightWords := newWords
+        }
+    }
     elapsed := Round(msStr)
     ; Find the word whose [start_ms, end_ms) contains elapsed.
     idx := FindWordIndex(HighlightWords, elapsed)
@@ -864,10 +873,11 @@ ShowTranscript(*) {
     TranscriptGui := Gui("+AlwaysOnTop +Resize +MinSize300x200", "ReadAloudTTS Transcript")
     TranscriptGui.BackColor := "1a1a2e"
     TranscriptGui.SetFont("s12", "Segoe UI")
-    ; Scrollable read-only Edit control.
+    ; Scrollable read-only Edit control (+VScroll shows the scrollbar so
+    ; long transcripts can be navigated; previously -VScroll hid it).
     TranscriptGui.MarginX := 12
     TranscriptGui.MarginY := 12
-    editCtrl := TranscriptGui.Add("Edit", "w600 h400 +ReadOnly -VScroll +Wrap cWhite Background1a1a2e", text)
+    editCtrl := TranscriptGui.Add("Edit", "w600 h400 +ReadOnly +VScroll +Wrap cWhite Background1a1a2e", text)
     ; Close button.
     TranscriptGui.Add("Button", "default w120 x260 h32", "Close").OnEvent("Click", (*) => CloseTranscript())
     TranscriptGui.OnEvent("Close", (*) => CloseTranscript())
