@@ -28,3 +28,9 @@ Every Piper voice can have its own model card, dataset source, and license terms
 - Do not commit generated WAV files.
 - Do not redistribute downloaded voices from this repository.
 - Keep voice licensing notes visible in installer and downloader flows.
+
+## Upstream licensing position (verified 2026-08-22)
+
+- The Piper project "does not impose any additional licenses on the checkpoints or voice models" (rhasspy/piper discussion #271).
+- The `rhasspy/piper-voices` repository is released under the **MIT license**, permitting commercial use, modification, and redistribution with attribution (huggingface.co/rhasspy/piper-voices).
+- Per-voice model cards may reference specific dataset sources; review them for commercial/redistribution scenarios. The notes above are preserved per voice.
