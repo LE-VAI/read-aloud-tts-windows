@@ -59,6 +59,11 @@ $*^!t::ShowTranscript()
 $*^+8::AdjustSpeed(0.9)
 $*^/::AdjustSpeed(1.1)
 
+; Click-to-rewind on the highlight overlay: register the WM_LBUTTONDOWN
+; monitor ONCE here. Previously it was registered inside every
+; ShowHighlightOverlay() build, stacking duplicate message handlers.
+OnMessage(0x201, OverlayClickHandler)
+
 StartDaemon()
 
 ; ---------------------------------------------------------------------------
@@ -582,10 +587,14 @@ StopHighlightTimer() {
 }
 
 HighlightTick() {
-    global HighlightPath, HighlightGui, HighlightPaused
-    ; Check mouse-leave resume (hover-pause: resume when mouse leaves overlay).
-    if (HighlightGui != "" and HighlightPaused) {
-        if !IsMouseOverOverlay() {
+    global HighlightGui, HighlightPaused
+    ; Hover-pause/resume via this 30ms poll — Gui has no MouseMove event in
+    ; AHK v2, so we compare the window under the cursor against the overlay.
+    if (HighlightGui != "") {
+        mouseOver := IsMouseOverOverlay()
+        if (mouseOver and !HighlightPaused) {
+            OverlayHoverPause()
+        } else if (!mouseOver and HighlightPaused) {
             OverlayMouseLeaveResume()
         }
     }
@@ -696,11 +705,12 @@ ShowHighlightOverlay(text) {
     HighlightGui.MarginY := 12
     ; -E0x200 removes WS_EX_TRANSPARENT from the Edit control too.
     editCtrl := HighlightGui.Add("Edit", "w" . (panelWidth - 32) . " h" . (panelHeight - 24) . " -VScroll cWhite Background1a1a2e", text)
-    ; Hover-pause: when mouse enters the overlay, pause speech.
-    ; Mouse leaves: resume from current word.
-    HighlightGui.OnEvent("MouseMove", OverlayHoverPause)
-    ; Click on the Edit control: rewind to the clicked word.
-    OnMessage(0x201, OverlayClickHandler)  ; WM_LBUTTONDOWN
+    ; NOTE: hover-pause is implemented by polling IsMouseOverOverlay() in
+    ; HighlightTick — Gui.OnEvent("MouseMove", ...) is INVALID in AHK v2
+    ; (valid events are Close/Escape/Size/ContextMenu/DropFiles) and threw
+    ; "Parameter #1 of Gui.Prototype.OnEvent is invalid" on every read.
+    ; Click-to-rewind uses OnMessage(WM_LBUTTONDOWN), registered ONCE in the
+    ; auto-execute section — registering per-overlay-build stacked handlers.
     ; Make the window translucent (220/255 opacity).
     HighlightGui.Show("x" . panelX . " y" . panelY . " w" . panelWidth . " h" . panelHeight . " NA")
     SetTranslucent(HighlightGui.Hwnd, 220)
