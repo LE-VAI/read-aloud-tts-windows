@@ -15,6 +15,10 @@ global ResponsePath := TempDir . "\response.json"
 global HighlightPath := TempDir . "\highlight_state.json"
 global PyExe := AppDir . "\.venv\Scripts\python.exe"
 global Q := Chr(34)
+; Last daemon response content — WaitResponse() captures it (before
+; deleting the response file) so callers can inspect status/message
+; without racing the file away.
+global LastResponse := ""
 
 ; Highlight overlay state
 global HighlightGui := ""
@@ -97,7 +101,7 @@ EnsureDaemonAlive() {
     if !FileExist(DaemonReadyPath)
         return false  ; No marker — not ready. StartDaemon will spawn fresh.
     try FileDelete ResponsePath
-    FileAppend '{"action":"ping"}', RequestPath, "UTF-8"
+    FileAppend '{"action":"ping"}', RequestPath, "UTF-8-RAW"
     if WaitResponse(2)
         return true  ; Daemon responded — alive and ready.
     ; Stale marker from a crashed daemon. Clean up so StartDaemon respawns.
@@ -110,7 +114,7 @@ EnsureDaemonAlive() {
 SendDaemonQuit(timeoutSec := 3) {
     global RequestPath, ResponsePath
     try FileDelete ResponsePath
-    FileAppend '{"action":"quit"}', RequestPath, "UTF-8"
+    FileAppend '{"action":"quit"}', RequestPath, "UTF-8-RAW"
     return WaitResponse(timeoutSec)
 }
 
@@ -121,7 +125,7 @@ PruneStaleDaemon() {
     }
     ; Ping the daemon. If it responds, it's alive — keep the marker.
     try FileDelete ResponsePath
-    FileAppend '{"action":"ping"}', RequestPath, "UTF-8"
+    FileAppend '{"action":"ping"}', RequestPath, "UTF-8-RAW"
     if WaitResponse(2) {
         return  ; Daemon is alive and responsive.
     }
@@ -144,7 +148,7 @@ StartDaemon() {
     cmd := Q . PyExe . Q . " " . Q . AppDir . "\speak.py" . Q . " --serve"
     Run(cmd, AppDir, "Hide", &pid)
     try FileDelete DaemonPidPath
-    FileAppend pid, DaemonPidPath, "UTF-8"
+    FileAppend pid, DaemonPidPath, "UTF-8-RAW"
     if WaitDaemonReady(10) {
         return  ; Daemon came up normally.
     }
@@ -157,7 +161,7 @@ StartDaemon() {
     Sleep 800  ; Give the OS time to release the mutex after exit.
     Run(cmd, AppDir, "Hide", &pid)
     try FileDelete DaemonPidPath
-    FileAppend pid, DaemonPidPath, "UTF-8"
+    FileAppend pid, DaemonPidPath, "UTF-8-RAW"
     if WaitDaemonReady(10)
         TrayTip "TTS daemon recovered", "ReadAloudTTS"
     else
@@ -184,7 +188,7 @@ StopDaemon() {
     Sleep 500
     ; Force-kill by PID if still alive (fallback if quit wasn't processed).
     if FileExist(DaemonPidPath) {
-        pidText := Trim(FileRead(DaemonPidPath, "UTF-8"))
+        pidText := Trim(FileRead(DaemonPidPath, "UTF-8-RAW"))
         if RegExMatch(pidText, "^\d+$") {
             try ProcessClose Integer(pidText)
         }
@@ -210,12 +214,25 @@ InitTray() {
     voiceMenu := Menu()
     voices := GetVoiceMap()
     current := GetCurrentVoice()
+    installedCount := 0
     for voiceId, label in voices {
+        ; Only offer voices whose model files exist — a menu entry whose
+        ; download was never run is a guaranteed-broken click that poisons
+        ; current_voice (the "switch to Amy" failure: files absent, every
+        ; later read then fails).
+        if !VoiceFilesInstalled(voiceId) {
+            continue
+        }
+        installedCount++
         boundId := voiceId
         voiceMenu.Add(label, (*) => SetVoice(boundId))
         if (voiceId = current) {
             voiceMenu.Check(label)
         }
+    }
+    if (installedCount = 0) {
+        voiceMenu.Add("No voices installed — run download_voices.ps1", (*) => {})
+        voiceMenu.Disable("No voices installed — run download_voices.ps1")
     }
     A_TrayMenu.Add("Voice", voiceMenu)
     A_TrayMenu.Add()
@@ -260,7 +277,7 @@ CycleSpeed(*) {
     ; Send the target speed directly.
     global RequestPath, ResponsePath
     try FileDelete ResponsePath
-    FileAppend '{"action":"set_speed","speed":' . target . '}', RequestPath, "UTF-8"
+    FileAppend '{"action":"set_speed","speed":' . target . '}', RequestPath, "UTF-8-RAW"
     WaitResponse(3)
     InitTray()
     TrayTip GetSpeedLabel(), "ReadAloudTTS Speed"
@@ -284,7 +301,7 @@ GetVoiceMap() {
     voices := Map()
 
     try {
-        content := FileRead(ConfigPath, "UTF-8")
+        content := FileRead(ConfigPath, "UTF-8-RAW")
         pos := 1
         pattern := '"([^"]+)"\s*:\s*\{[^{}]*"label"\s*:\s*"([^"]+)"'
         while RegExMatch(content, pattern, &match, pos) {
@@ -316,26 +333,53 @@ GetCurrentVoice() {
     return "en_US-lessac-medium"
 }
 
+VoiceFilesInstalled(voiceId) {
+    ; Check the model + config files for a voice exist, mirroring
+    ; voice_files_exist() in speak.py. The voice entry's file paths are
+    ; parsed from config.json; missing file entries count as absent.
+    global AppDir, ConfigPath
+    try {
+        content := FileRead(ConfigPath, "UTF-8")
+        pat := '"' . voiceId . '"\s*:\s*\{[^{}]*?"model"\s*:\s*"([^"]+)"[^{}]*?"config"\s*:\s*"([^"]+)"'
+        if RegExMatch(content, pat, &m) {
+            return FileExist(AppDir . "\" . m[2]) and FileExist(AppDir . "\" . m[3])
+        }
+    }
+    return false
+}
+
 SetVoice(voiceId, *) {
     global Q, PyExe, AppDir, ResponsePath, RequestPath
     StopSpeech()
 
+    if IsDaemonReady() {
+        ; Daemon-direct switch: the daemon validates the voice, loads the
+        ; model, and persists config.json itself — no synchronous Python
+        ; RunWait blocking the AHK thread. The old RunWait path froze the
+        ; app for the duration of a Python interpreter cold start AND let
+        ; the CLI write config before the daemon learned about it.
+        req := '{"action":"set_voice","voice":"' . voiceId . '"}'
+        try FileDelete ResponsePath
+        FileAppend req, RequestPath, "UTF-8-RAW"
+        ok := WaitResponse(20)
+        resp := LastResponse
+        InitTray()
+        if (ok and InStr(resp, '"ok"')) {
+            TrayTip "Voice set to " . voiceId, "ReadAloudTTS"
+        } else {
+            TrayTip "Could not switch voice: " . (resp != "" ? resp : "daemon not responding"), "ReadAloudTTS"
+        }
+        return
+    }
+
+    ; Daemon not running — fall back to the CLI path (fresh-boot voice pick).
     if !FileExist(PyExe) {
         TrayTip "Python environment missing. Run install.ps1.", "ReadAloudTTS"
         return
     }
-
     cmd := Q . PyExe . Q . " " . Q . AppDir . "\speak.py" . Q . " --set-voice " . Q . voiceId . Q
     exitCode := RunWait(cmd, AppDir, "Hide")
     if (exitCode = 0) {
-        ; Tell the daemon to reload the voice if it's running.
-        if IsDaemonReady() {
-            req := '{"action":"set_voice","voice":"' . voiceId . '"}'
-            try FileDelete ResponsePath
-            FileAppend req, RequestPath, "UTF-8"
-            ; Wait briefly for the daemon to process it.
-            WaitResponse(3)
-        }
         InitTray()
         TrayTip "Voice set to " . voiceId, "ReadAloudTTS"
     } else {
@@ -409,20 +453,32 @@ ReadSelection(*) {
 }
 
 SpeakViaDaemon(text) {
-    global RequestPath, ResponsePath, HighlightPath
+    global RequestPath, ResponsePath, HighlightPath, LastResponse
     ; Escape the text for JSON.
     jsonText := JsonEscape(text)
     req := '{"action":"speak","text":"' . jsonText . '"}'
     ; Clean up any stale response and highlight files.
     try FileDelete ResponsePath
     try FileDelete HighlightPath
-    FileAppend req, RequestPath, "UTF-8"
+    FileAppend req, RequestPath, "UTF-8-RAW"
     ; Start the highlight overlay timer only when enabled (opt-in).
     if ShowOverlayEnabled() {
         StartHighlightTimer()
     }
-    ; Wait for the response (up to 120s for long text).
-    WaitResponse(120)
+    ; Wait for the response (up to 120s for long text). The daemon replies
+    ; "Speak started" immediately after spawning the playback worker; an
+    ; error status here means nothing will play — surface it instead of
+    ; failing silently (the 2026-08-30 outage was 20 minutes of silent
+    ; error responses with zero user-visible feedback).
+    if WaitResponse(120) {
+        if !InStr(LastResponse, '"ok"') {
+            msg := LastResponse
+            if RegExMatch(msg, '"message"\s*:\s*"([^"]*)"', &m) {
+                msg := m[1]
+            }
+            TrayTip "ReadAloudTTS: " . msg, "Read failed"
+        }
+    }
 }
 
 SpeakColdStart(text) {
@@ -433,14 +489,16 @@ SpeakColdStart(text) {
     cmd := Q . PyExe . Q . " " . Q . AppDir . "\speak.py" . Q . " --input-file " . Q . inputPath . Q . " --delete-input-file"
     Run(cmd, AppDir, "Hide", &pid)
     try FileDelete PidPath
-    FileAppend pid, PidPath, "UTF-8"
+    FileAppend pid, PidPath, "UTF-8-RAW"
 }
 
 WaitResponse(timeoutSec := 120) {
-    global ResponsePath
+    global ResponsePath, LastResponse
+    LastResponse := ""
     endTick := A_TickCount + (timeoutSec * 1000)
     while (A_TickCount < endTick) {
         if FileExist(ResponsePath) {
+            try LastResponse := FileRead(ResponsePath, "UTF-8")
             try FileDelete ResponsePath
             return true
         }
@@ -470,7 +528,7 @@ JsonEscape(text) {
 GetCurrentSpeed() {
     global ConfigPath
     try {
-        content := FileRead(ConfigPath, "UTF-8")
+        content := FileRead(ConfigPath, "UTF-8-RAW")
         if RegExMatch(content, '"length_scale"\s*:\s*([\d.]+)', &m) {
             return Round(m[1], 2)
         }
@@ -490,11 +548,11 @@ SendSpeed(speed) {
         return  ; No change needed.
     try FileDelete ResponsePath
     req := '{"action":"set_speed","speed":' . newSpeed . '}'
-    FileAppend req, RequestPath, "UTF-8"
+    FileAppend req, RequestPath, "UTF-8-RAW"
     if WaitResponse(3) {
         ; Read the daemon's response for a human-friendly label.
         try {
-            resp := FileRead(ResponsePath, "UTF-8")
+            resp := FileRead(ResponsePath, "UTF-8-RAW")
         } catch {
             resp := ""
         }
@@ -525,7 +583,7 @@ ResetSpeed() {
         return
     }
     try FileDelete ResponsePath
-    FileAppend '{"action":"set_speed","speed":1.0}', RequestPath, "UTF-8"
+    FileAppend '{"action":"set_speed","speed":1.0}', RequestPath, "UTF-8-RAW"
     WaitResponse(3)
     TrayTip "Normal speed", "ReadAloudTTS Speed"
 }
@@ -534,7 +592,7 @@ DebugLog(msg) {
     global TempDir
     logPath := TempDir . "\working_debug.log"
     ts := FormatTime(A_Now, "yyyy-MM-dd HH:mm:ss")
-    try FileAppend "[" . ts . "] " . msg . "`n", logPath, "UTF-8"
+    try FileAppend "[" . ts . "] " . msg . "`n", logPath, "UTF-8-RAW"
 }
 
 RestoreClipboard(savedClipboard) {
@@ -553,12 +611,12 @@ StopSpeech(*) {
     ; If the daemon is running, send it a stop request.
     if IsDaemonReady() {
         try FileDelete ResponsePath
-        FileAppend '{"action":"stop"}', RequestPath, "UTF-8"
+        FileAppend '{"action":"stop"}', RequestPath, "UTF-8-RAW"
         WaitResponse(3)
     }
     ; Also kill any cold-start speak.py process.
     if FileExist(PidPath) {
-        pidText := Trim(FileRead(PidPath, "UTF-8"))
+        pidText := Trim(FileRead(PidPath, "UTF-8-RAW"))
         if RegExMatch(pidText, "^\d+$") {
             try ProcessClose Integer(pidText)
         }
@@ -631,7 +689,7 @@ HighlightTick() {
         return
     }
     try {
-        raw := FileRead(HighlightPath, "UTF-8")
+        raw := FileRead(HighlightPath, "UTF-8-RAW")
     } catch {
         return
     }
@@ -717,7 +775,7 @@ HighlightOnStop() {
 ShowOverlayEnabled() {
     global ConfigPath
     try {
-        content := FileRead(ConfigPath, "UTF-8")
+        content := FileRead(ConfigPath, "UTF-8-RAW")
         if RegExMatch(content, '"highlight_overlay"\s*:\s*(true|false)', &m) {
             return (m[1] = "true")
         }
@@ -729,14 +787,14 @@ ToggleOverlayEnabled() {
     global ConfigPath
     newVal := ShowOverlayEnabled() ? "false" : "true"
     try {
-        content := FileRead(ConfigPath, "UTF-8")
+        content := FileRead(ConfigPath, "UTF-8-RAW")
         if RegExMatch(content, '"highlight_overlay"\s*:') {
             content := RegExReplace(content, '"highlight_overlay"\s*:\s*(true|false)', '"highlight_overlay": ' . newVal)
         } else {
             content := RegExReplace(content, '\{', '{' . Q . 'highlight_overlay' . Q . ': ' . newVal . ', ', , 1)
         }
         FileDelete ConfigPath
-        FileAppend content, ConfigPath, "UTF-8"
+        FileAppend content, ConfigPath, "UTF-8-RAW"
     }
     return ShowOverlayEnabled()
 }
@@ -854,7 +912,7 @@ SeekFromWord(idx) {
     try FileDelete HighlightPath
     jsonText := JsonEscape(HighlightFullText)
     req := '{"action":"speak","text":"' . jsonText . '","from_word":' . idx . '}'
-    FileAppend req, RequestPath, "UTF-8"
+    FileAppend req, RequestPath, "UTF-8-RAW"
     ; Restart the highlight timer (only when the overlay is enabled).
     if ShowOverlayEnabled() {
         StartHighlightTimer()
@@ -865,7 +923,7 @@ StopSpeechDaemon() {
     global RequestPath, ResponsePath
     if IsDaemonReady() {
         try FileDelete ResponsePath
-        FileAppend '{"action":"stop"}', RequestPath, "UTF-8"
+        FileAppend '{"action":"stop"}', RequestPath, "UTF-8-RAW"
         WaitResponse(3)
     }
 }

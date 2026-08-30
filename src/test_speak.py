@@ -428,6 +428,107 @@ def test_normalize_text_long_input_ends_cleanly():
 
 
 # ---------------------------------------------------------------------------
+# Config BOM tolerance + voice validation (regression: 2026-08-30 outage)
+# ---------------------------------------------------------------------------
+
+def test_read_config_bytes_strips_bom():
+    """A BOM-prefixed config (written by AHK FileAppend "UTF-8") must read
+    identically to a clean one. This is the 2026-08-30 outage: one AHK
+    tray-toggle rewrote config.json with a BOM and Python fell back to
+    empty defaults — the app silently lost its voice list and every Home
+    press failed for 20 minutes.
+    """
+    import json as _json
+    import tempfile
+    import speak
+
+    valid = b'{"current_voice": "x", "voices": {"x": {"model": "m", "config": "c"}}}'
+    with tempfile.NamedTemporaryFile(suffix=".json", delete=False) as f:
+        f.write(b"\xef\xbb\xbf" + valid)
+        tmp_path = Path(f.name)
+    try:
+        orig = speak.CONFIG_PATH
+        speak.CONFIG_PATH = tmp_path
+        cfg = speak.load_config()
+        assert cfg["current_voice"] == "x", "BOM must not break config parsing"
+        assert len(cfg["voices"]) == 1
+    finally:
+        speak.CONFIG_PATH = orig
+        tmp_path.unlink(missing_ok=True)
+
+
+def test_read_config_bytes_clean_file_untouched():
+    """A BOM-less config must read back its exact contents."""
+    import tempfile
+    import speak
+
+    valid = b'{"a": 1}'
+    with tempfile.NamedTemporaryFile(suffix=".json", delete=False) as f:
+        f.write(valid)
+        tmp_path = Path(f.name)
+    try:
+        orig = speak.CONFIG_PATH
+        speak.CONFIG_PATH = tmp_path
+        cfg = speak.load_config()
+        assert cfg == {"a": 1}
+    finally:
+        speak.CONFIG_PATH = orig
+        tmp_path.unlink(missing_ok=True)
+
+
+def test_voice_files_exist_false_for_missing_files():
+    """voice_files_exist must return False for entries whose files are absent
+    (a menu entry whose download was never run must not be selectable)."""
+    import speak
+
+    assert speak.voice_files_exist({"model": "does/not/exist.onnx", "config": "nope.json"}) is False
+
+
+def test_voice_files_exist_true_for_real_files():
+    import tempfile
+    import speak
+
+    with tempfile.TemporaryDirectory() as d:
+        model = Path(d) / "v.onnx"
+        conf = Path(d) / "v.onnx.json"
+        model.write_bytes(b"m")
+        conf.write_bytes(b"c")
+        # Absolute paths: pathlib's APP_DIR / abs resolves to the absolute
+        # path itself, so this exercises the True branch.
+        assert speak.voice_files_exist({"model": str(model), "config": str(conf)}) is True
+
+
+def test_set_voice_rejects_missing_files():
+    """set_voice must refuse to persist a voice whose files are missing —
+    the old behavior poisoned current_voice for every later read."""
+    import json as _json
+    import tempfile
+    import speak
+
+    with tempfile.NamedTemporaryFile(suffix=".json", delete=False, mode="w") as f:
+        _json.dump(
+            {"voices": {"ghost": {"model": "ghost.onnx", "config": "ghost.json"}}},
+            f,
+        )
+        tmp_path = Path(f.name)
+    try:
+        orig = speak.CONFIG_PATH
+        speak.CONFIG_PATH = tmp_path
+        try:
+            speak.set_voice("ghost")
+            raised = False
+        except SystemExit:
+            raised = True
+        assert raised, "set_voice must SystemExit for a voice with missing files"
+        # Config must NOT have been modified.
+        saved = _json.loads(tmp_path.read_text())
+        assert "current_voice" not in saved
+    finally:
+        speak.CONFIG_PATH = orig
+        tmp_path.unlink(missing_ok=True)
+
+
+# ---------------------------------------------------------------------------
 # Runner for manual execution (python src/test_speak.py)
 # ---------------------------------------------------------------------------
 

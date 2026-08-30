@@ -21,7 +21,7 @@ CONFIG_PATH = APP_DIR / "config.json"
 LOG_PATH = APP_DIR / "logs" / "readaloud.log"
 TMP_DIR = APP_DIR / "tmp"
 PIPER_TIMEOUT_SECONDS = 90
-VERSION = "0.8.1"
+VERSION = "0.8.2"
 UNICODE_REPLACEMENTS = str.maketrans(
     {
         "\u2018": "'",
@@ -52,12 +52,30 @@ def notify_error(message: str) -> None:
         pass
 
 
+def _read_config_bytes() -> bytes:
+    """Read raw config bytes, stripping a UTF-8 BOM if present.
+
+    AHK v2 FileAppend with "UTF-8" encoding writes a 3-byte BOM (EF BB BF)
+    on every file creation. When the tray toggles rewrite config.json, the
+    BOM lands in the file and Python's plain "utf-8" decoder rejects it —
+    json.load fails, every consumer falls back to empty defaults, and the
+    app silently loses its voice list (the 2026-08-30 outage: one tray
+    toggle silenced every later Home press). Tolerating the BOM at the
+    read boundary makes the shared file robust regardless of which side
+    wrote it last.
+    """
+    raw = CONFIG_PATH.read_bytes()
+    if raw.startswith(b"\xef\xbb\xbf"):
+        raw = raw[3:]
+    return raw
+
+
 def load_config() -> dict[str, Any]:
     """Load config.json, falling back to defaults on corruption or missing file."""
     try:
-        with CONFIG_PATH.open("r", encoding="utf-8") as file:
-            return json.load(file)
-    except (json.JSONDecodeError, FileNotFoundError, OSError) as e:
+        text = _read_config_bytes().decode("utf-8")
+        return json.loads(text)
+    except (json.JSONDecodeError, UnicodeDecodeError, FileNotFoundError, OSError) as e:
         import logging
         logging.warning("Config load failed (%s) — using fallback defaults", e)
         return _default_config()
@@ -80,14 +98,46 @@ def _default_config() -> dict[str, Any]:
 
 
 def save_config(config: dict[str, Any]) -> None:
-    CONFIG_PATH.write_text(json.dumps(config, indent=2) + "\n", encoding="utf-8")
+    """Write config.json atomically (temp file + replace).
+
+    The AHK tray and this daemon both read config.json at arbitrary
+    moments; a direct in-place write can be caught half-written by the
+    other side. os.replace is atomic on the same volume, so readers see
+    either the old or the new file, never a torn one.
+    """
+    tmp_path = CONFIG_PATH.with_name("config.json.tmp")
+    tmp_path.write_text(json.dumps(config, indent=2) + "\n", encoding="utf-8")
+    tmp_path.replace(CONFIG_PATH)
+
+
+def voice_files_exist(voice: dict[str, Any]) -> bool:
+    """True if the model + config files referenced by a voice entry exist on disk."""
+    try:
+        model = APP_DIR / voice["model"]
+        voice_config = APP_DIR / voice["config"]
+    except (KeyError, TypeError):
+        return False
+    return model.is_file() and voice_config.is_file()
 
 
 def set_voice(voice_id: str) -> None:
+    """Set the current voice. Validates against config AND model files on disk.
+
+    The old version persisted current_voice before checking that the model
+    files exist — picking a never-downloaded voice (an entry listed in
+    config.json without its files fetched) poisoned every later read with
+    an unusable current_voice, and the failure only surfaced on the next
+    speak attempt.
+    """
     config = load_config()
     voices = config.get("voices", {})
     if voice_id not in voices:
         raise SystemExit(f"Unknown voice: {voice_id}")
+    if not voice_files_exist(voices[voice_id]):
+        raise SystemExit(
+            f"Voice files are missing for {voice_id}. "
+            "Run install.ps1 or download_voices.ps1 to fetch them."
+        )
     config["current_voice"] = voice_id
     save_config(config)
     logging.info("Voice changed to %s", voice_id)

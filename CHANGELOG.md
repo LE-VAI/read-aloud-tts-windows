@@ -1,5 +1,25 @@
 # Changelog
 
+
+## 0.8.2 - Voice-switch reliability (2026-08-30)
+
+### Fixed
+- **Voice switching no longer breaks the app** — three stacked failure modes, all fixed:
+  - **UTF-8 BOM poisoning (root cause of the 2026-08-30 total outage):** AHK v2 `FileAppend` with `"UTF-8"` encoding writes a 3-byte BOM when it *creates* a file. One tray-toggle click rewrote `config.json` with a BOM; Python's `json` rejected it and silently fell back to empty defaults — the app lost its voice list and every Home press failed silently for 20 minutes. Fixed on both sides: every AHK write now uses `"UTF-8-RAW"` (25 call sites), and `load_config()` strips a leading BOM before parsing so the shared file is robust regardless of which side wrote it last.
+  - **Ghost voices in the menu:** the tray Voice menu listed every `config.json` entry, but two of five voices had never been downloaded. Picking one could never work — and the old `set_voice` persisted the selection *before* checking the files exist, poisoning `current_voice` for every later read. Now the menu lists only installed voices, and both the CLI and daemon validate model files before persisting (a missing-files voice gets a clean refusal, config untouched).
+  - **UI freeze on switch:** the tray Voice handler ran a synchronous `RunWait` Python process — the whole app froze for a Python cold start on every switch. Switching now goes daemon-direct: `set_voice` request over the existing IPC, validated + persisted by the daemon, ~0.2s with a warm cache.
+- **Silent failures now speak up:** `SpeakViaDaemon` never read the daemon's response, so error statuses played nothing and showed nothing. `WaitResponse` now captures the response content; speak failures surface the daemon's message as a tray tip.
+- **Daemon no longer starts "ready" with zero voices:** startup now falls back to any installed voice when the configured one is unusable, and exits with a clear log line (instead of becoming a silent zombie) when no usable voice exists.
+- **Config can no longer be overwritten with empty defaults:** `set_speed`/`set_voice` in the daemon refuse to persist when the loaded config has no voices (corrupt/missing file) — previously a speed tweak after a config read failure would write the empty fallback over the user's real config, permanently destroying the voice list.
+
+### Added
+- **Regression tests for the outage class** (5 new, 60 total): BOM-prefixed config parses identically to clean config, clean files pass through untouched, `voice_files_exist` detects missing/real files, and `set_voice` refuses to persist a voice with missing files.
+- **Atomic config writes:** `save_config` writes to a temp file and `os.replace`s it — the AHK tray and daemon can never read a torn half-written file.
+- **Bounded voice cache (max 8)** with research-backed sizing: ONNX Runtime's session destroy/create cycle is a documented RSS leak in long-running processes (microsoft/onnxruntime#26831), so the cache is deliberately sized above the full catalog — switches between loaded voices stay instant and leak-free, and the bound is only a safety valve against pathological configs.
+
+## Unreleased - Audit fixes (0.8.1)
+
+
 ## Unreleased - Audit fixes (0.8.1)
 
 ### Added
@@ -205,3 +225,9 @@ The overnight issue: AHK deleted `daemon_ready` on every startup (even when the 
 - Added Python Piper TTS runner with text chunking and temporary WAV cleanup.
 - Added installer, uninstaller, voice downloader, documentation, and sanitization checks.
 - Excluded voice models, logs, temp files, virtual environments, and local config from source control.
+
+## Unreleased - Launch polish
+
+### Added
+- **App icon everywhere** — multi-size `app.ico` (16/24/32/48/64/128/256) generated from the logo; tray icon branded via `TraySetIcon` (was AutoHotkey's generic icon), tray hover tooltip ("ReadAloudTTS — select text, press Home"), and the Startup shortcut gets `IconLocation`. `install.ps1` copies the icon into the install dir automatically.
+- **README badges** — CI status, latest release, and license badges above the fold.

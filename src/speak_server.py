@@ -34,6 +34,7 @@ import sys
 import threading
 import time
 import wave
+from collections import OrderedDict
 from pathlib import Path
 from typing import Any
 
@@ -48,7 +49,9 @@ from speak import (
     chunk_text,
     load_config,
     normalize_text,
+    save_config,
     setup_logging,
+    voice_files_exist,
 )
 
 # Piper is imported lazily (inside _load_voice / serve) so the pure-logic
@@ -74,7 +77,17 @@ def _ensure_piper():
 # Model cache
 # ---------------------------------------------------------------------------
 
-_voice_cache: dict[str, Any] = {}
+# Bounded cache, sized above the full voice catalog. A loaded voice IS an
+# ONNX Runtime InferenceSession (63-114MB model plus arena overhead), and
+# ORT's session destroy/create cycle is a documented RSS leak in
+# long-running processes (microsoft/onnxruntime#26831: repeated
+# create/destroy grows RSS ~1.5GB/hr and arena memory is never returned
+# to the OS). Evicting on switch would force exactly that churn — so the
+# bound sits above the realistic catalog size (5 voices in config) and
+# only exists as a safety valve against a pathological config. Switches
+# between already-loaded voices stay instant and leak-free.
+_voice_cache: "OrderedDict[str, Any]" = OrderedDict()
+_VOICE_CACHE_MAX = 8
 _current_voice_id: str | None = None
 _playback_lock = threading.Lock()
 _stop_requested = False
@@ -90,8 +103,9 @@ _heartbeat_stop = threading.Event()
 
 
 def _load_voice(voice_id: str) -> Any:
-    """Load a PiperVoice model, caching it by voice_id for reuse."""
+    """Load a PiperVoice model, caching it by voice_id for reuse (LRU)."""
     if voice_id in _voice_cache:
+        _voice_cache.move_to_end(voice_id)
         return _voice_cache[voice_id]
 
     config = load_config()
@@ -156,6 +170,16 @@ def _load_voice(voice_id: str) -> Any:
         # config entries — log and fall back to Piper's default session.
         logging.warning("Could not install tuned ORT session (%s); using Piper default", e)
     _voice_cache[voice_id] = pv
+    _voice_cache.move_to_end(voice_id)
+    # Eviction is a last-resort safety valve only (see cache declaration:
+    # ORT session churn leaks RSS, so the bound is deliberately generous).
+    while len(_voice_cache) > _VOICE_CACHE_MAX:
+        evicted_id, evicted_pv = _voice_cache.popitem(last=False)
+        logging.warning(
+            "Voice cache bound exceeded (%d); evicting %s — a later switch "
+            "back will reload (and the bound should be raised)",
+            _VOICE_CACHE_MAX, evicted_id,
+        )
     logging.info("Loaded Piper model for voice: %s", voice_id)
     return pv
 
@@ -578,15 +602,31 @@ def handle_speak(text: str, from_word: int = 0) -> dict[str, str]:
 
 
 def handle_set_voice(voice_id: str) -> dict[str, str]:
-    """Switch the current voice and persist to config.json."""
+    """Switch the current voice and persist to config.json.
+
+    Validation order matters: load the model FIRST, and only persist
+    current_voice after the load succeeds. Persisting before validation
+    poisons config.json for every later read if the voice files are
+    missing — and worse, a later speed change would then write the
+    empty-voices fallback BACK over the file, permanently destroying the
+    user's voice list.
+    """
     global _current_voice_id
+    voices = load_config().get("voices", {})
+    if voice_id not in voices:
+        return {"status": "error", "message": f"Unknown voice: {voice_id}"}
+    if not voice_files_exist(voices[voice_id]):
+        return {
+            "status": "error",
+            "message": f"Voice files missing for {voice_id} — run download_voices.ps1",
+        }
     voice = _load_voice(voice_id)
     if voice is None:
         return {"status": "error", "message": f"Could not load voice: {voice_id}"}
     _current_voice_id = voice_id
     config = load_config()
     config["current_voice"] = voice_id
-    CONFIG_PATH.write_text(json.dumps(config, indent=2) + "\n", encoding="utf-8")
+    save_config(config)
     logging.info("Voice set to %s", voice_id)
     return {"status": "ok", "message": f"Voice set to {voice_id}"}
 
@@ -603,10 +643,23 @@ def handle_set_speed(speed: float) -> dict[str, str]:
     global _runtime_length_scale
     speed = max(0.5, min(2.0, round(speed, 2)))
     _runtime_length_scale = speed
-    # Persist to config so it survives restarts.
+    # Persist to config so it survives restarts — but only if the loaded
+    # config actually parsed. If load_config hit its fallback (corrupt or
+    # BOM-poisoned file), persisting here would write the EMPTY fallback
+    # over the user's real config, permanently destroying the voice list.
     config = load_config()
+    if not config.get("voices"):
+        logging.warning(
+            "set_speed: config has no voices (corrupt/missing?) — NOT persisting "
+            "to avoid overwriting the file with empty defaults"
+        )
+        return {
+            "status": "ok",
+            "message": f"Speed set for this session only (config unreadable)",
+            "speed": speed,
+        }
     config["length_scale"] = speed
-    CONFIG_PATH.write_text(json.dumps(config, indent=2) + "\n", encoding="utf-8")
+    save_config(config)
     logging.info("Speed set to %.2f", speed)
     # Return a human-friendly multiplier (1.0 = normal, 0.5 = 2x fast, 2.0 = 2x slow)
     if speed < 1.0:
@@ -692,12 +745,40 @@ def serve() -> int:
 
     logging.info("speak_server starting")
 
-    # Pre-load the default voice so the first request is fast.
+    # Pre-load the current voice so the first request is fast. If it fails
+    # (voice not in config, or its model files missing — e.g. a config
+    # entry whose download was never run), fall back to ANY voice whose
+    # files exist on disk rather than starting up "ready" with zero
+    # usable voices — the old behavior marked the daemon ready and then
+    # silently failed every Home press.
     config = load_config()
     voice_id = config.get("current_voice", "en_US-lessac-medium")
     global _current_voice_id
     _current_voice_id = voice_id
-    _load_voice(voice_id)
+    loaded = _load_voice(voice_id)
+    if loaded is None:
+        voices = config.get("voices", {})
+        fallback = next(
+            (vid for vid, v in voices.items() if voice_files_exist(v)),
+            None,
+        )
+        if fallback is None:
+            logging.error(
+                "No usable voice found — exiting instead of starting a "
+                "silent zombie daemon. Check config.json and voices/ files."
+            )
+            ready_path = APP_DIR / "tmp" / "daemon_ready"
+            ready_path.unlink(missing_ok=True)
+            return 1
+        logging.warning(
+            "Configured voice %s unusable; falling back to %s", voice_id, fallback
+        )
+        voice_id = fallback
+        _current_voice_id = fallback
+        config["current_voice"] = fallback
+        if config.get("voices"):
+            save_config(config)
+        _load_voice(fallback)
     logging.info("speak_server ready (voice: %s)", voice_id)
 
     # Write a readiness marker so AHK knows the daemon is warm.
