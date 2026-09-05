@@ -1,0 +1,408 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Reading overlay</title>
+<!--
+  Reading overlay — daemon-served karaoke viewer for ReadAloudTTS.
+
+  The daemon owns the audio (Piper) and the clock; this page renders.
+  It reuses the read-along web component in external-clock mode: the
+  daemon's highlight state becomes the word list, and its ~30ms
+  "playing" updates become engine ticks. Clicking a word posts a seek
+  back to the daemon (the click-to-rewind gesture the legacy AHK
+  overlay invented) — the daemon restarts the audio from that word and
+  re-emits its state; this page re-anchors.
+
+  Served by overlay_server.py with %%HIGHLIGHT%% / %%ACCENT%% replaced
+  from the daemon config's highlight_color (hex -> plain rgb() — exotic
+  color functions can silently drop inside ::highlight() paint rules).
+-->
+<style>
+  :root { color-scheme: dark; }
+  html, body {
+    margin: 0;
+    padding: 0;
+    background: #16181d;
+    color: #e8e9ec;
+  }
+  body {
+    font: 400 clamp(17px, 1.6vw + 12px, 24px)/1.9 ui-sans-serif, system-ui, sans-serif;
+    min-height: 100vh;
+    box-sizing: border-box;
+    padding: 52px clamp(18px, 5vw, 64px) 40px;
+  }
+  #bar {
+    position: fixed;
+    left: 0; right: 0; top: 0;
+    display: flex;
+    align-items: center;
+    gap: 12px;
+    padding: 8px clamp(18px, 5vw, 64px);
+    background: rgb(13 14 18 / 0.92);
+    border-bottom: 1px solid rgb(255 255 255 / 0.08);
+    font-size: 13px;
+    color: #9aa0ab;
+    z-index: 10;
+    box-sizing: border-box;
+  }
+  #dot {
+    width: 8px; height: 8px;
+    border-radius: 50%;
+    background: #4a4f5a;
+    flex: none;
+    transition: background 120ms linear;
+  }
+  #dot.live { background: #79c47a; }
+  #hint { margin-left: auto; white-space: nowrap; opacity: 0.8; }
+  #placeholder { color: #9aa0ab; font-size: 15px; }
+  #placeholder b { color: #d7dae0; }
+  read-along { --ra-highlight: %%HIGHLIGHT%%; --ra-accent: %%ACCENT%%; }
+  #probe {
+    position: fixed;
+    left: 4px; bottom: 4px;
+    font: 11px/1.4 ui-monospace, monospace;
+    color: #6f7580;
+    z-index: 10;
+    white-space: pre;
+  }
+</style>
+<script type="module" src="/component/read-along.js"></script>
+<!-- Paint rules for the ::highlight() karaoke — the component registers
+     the ranges, but the ::highlight(read-along-word) rule that colors
+     them lives in this stylesheet (the invisible-highlight trap). -->
+<link rel="stylesheet" href="/component/read-along.css">
+<!-- ?autotest=1: a pending /autotest-hold image request holds the load
+     event (the headless camera's trigger) until the flow POSTs release. -->
+<script>
+  if (new URLSearchParams(location.search).get("autotest") === "1") {
+    document.currentScript.insertAdjacentHTML("afterend",
+      '<img id="autotest-hold" alt="" width="1" height="1" src="/autotest-hold" style="display:none">');
+  }
+</script>
+</head>
+<body>
+  <div id="bar">
+    <span id="dot" title="daemon connection"></span>
+    <span id="status">Waiting for the reader…</span>
+    <span id="hint">click a word to read from there</span>
+  </div>
+  <div id="placeholder">Select text anywhere and press <b>Home</b> — the reading appears here with each word highlighted as it is spoken.</div>
+  <div id="probe" hidden></div>
+
+  <script type="module">
+    import { ExternalEngine } from "/component/engines/external.js";
+
+    const $ = (id) => document.getElementById(id);
+    const dot = $("dot");
+    const statusEl = $("status");
+    const placeholder = $("placeholder");
+    const probe = $("probe");
+
+    const bridge = {
+      generation: 0,     // bumped per mounted read; stale replies dropped
+      seekPending: null, // {word, gen} while a seek's new start is in flight
+      text: "",          // full text currently rendered
+      segment: "",       // text of the current start payload (suffix after seek)
+      tokenBase: 0,       // shift: daemon word index -> component token index
+      lastMs: 0,         // last daemon elapsed reading (authoritative)
+      lastMsAt: 0,        // performance.now() of that reading
+      frozen: false,     // autotest receipt: hold the paused frame forever
+    };
+
+    let reader = null; // fresh <read-along> per reading
+    let engine = null; // its ExternalEngine
+
+    // Debug ring buffer — ?autotest=1 exposes window.__trace for live
+    // inspection; production runs pay one array-push per state change.
+    window.__trace = [];
+    const trace = (msg) => {
+      if (window.__trace.length < 500) {
+        window.__trace.push(`${Math.round(performance.now())}ms ${msg}`);
+      }
+    };
+
+    const setStatus = (msg) => { statusEl.textContent = msg; };
+    const setLive = (live) => { dot.classList.toggle("live", live); };
+    const countWords = (text) => (text.match(/\S+/g) || []).length;
+
+    // Daemon words [[word,startMs,endMs],...] -> engine words
+    // [[tokenIndex,startMs,endMs],...]. Both sides split on \S+ (verified
+    // identical across daemon _compute_word_timings, handle_speak's
+    // split(), and the component tokenizer), so daemon word i maps to
+    // token i + tokenBase.
+    const toEngineWords = (daemonWords, offset) =>
+      daemonWords.map((w, i) => [i + offset, Math.round(w[1]), Math.round(w[2])]);
+
+    const wireReader = (el) => {
+      // The daemon owns play/stop — the component's own controls
+      // (Listen/Restart/speed) would desync from the audio. Hide them;
+      // word-clicks (seekable) stay live.
+      const controls = el.shadowRoot?.querySelector(".ra-controls");
+      if (controls) controls.style.display = "none";
+
+      // Click-to-rewind: the component restarts its engine at the
+      // clicked token and emits "seek" (it also emits "stop" first —
+      // deliberately NOT forwarded: with the controls hidden, every
+      // component "stop" is internal (teardown/remount or our own
+      // end-state), and forwarding it would kill daemon audio mid-read.
+      // The seek POST carries the FULL text plus the token index, so
+      // the daemon can re-slice from that word across chained seeks.
+      el.addEventListener("seek", async (ev) => {
+        const tok = ev.detail?.token?.token ?? ev.detail?.token ?? -1;
+        if (typeof tok !== "number" || tok < 0) return;
+        bridge.seekPending = { word: tok, gen: bridge.generation };
+        // Re-anchor the local clock to the seeked word so smooth
+        // ticking advances from the click, not from the old read's ms.
+        const hit = engine.words.find(([t]) => t === tok);
+        if (hit) anchorClock(hit[1]);
+        setStatus("Seeking…");
+        try {
+          await fetch("/seek", {
+            method: "POST",
+            headers: { "Content-Type": "application/json" },
+            body: JSON.stringify({ text: bridge.text, from_word: tok }),
+          });
+        } catch {
+          bridge.seekPending = null;
+          setStatus("Seek failed — daemon unreachable");
+        }
+      });
+    };
+
+    // The component tokenizes exactly once per element (_prepare is
+    // guarded), so each new reading mounts a FRESH reader with its own
+    // engine — stale token maps are impossible. The old engine's rAF
+    // loop is stopped so it cannot keep ticking after removal.
+    const mountReader = (text) => {
+      if (engine) engine.stop();
+      if (reader) reader.remove();
+      reader = document.createElement("read-along");
+      reader.setAttribute("seekable", "");
+      reader.textContent = text;
+      document.body.appendChild(reader);
+      engine = new ExternalEngine({ words: [] });
+      reader.engine = engine;
+      wireReader(reader);
+      placeholder.style.display = "none";
+    };
+
+    // Re-anchor the smooth clock: the daemon's ms is authoritative.
+    const anchorClock = (ms) => {
+      bridge.lastMs = ms;
+      bridge.lastMsAt = performance.now();
+    };
+
+    const applyStart = (st) => {
+      trace(`start text=${(st.text ?? "").length}ch words=${(st.words ?? []).length}`);
+      const text = st.text ?? "";
+      if (!text) return;
+      const words = Array.isArray(st.words) ? st.words : [];
+      bridge.generation++;
+
+      // Seek vs fresh read: a seek's "start" carries the suffix text
+      // (first N words dropped, timings re-based to 0). The daemon
+      // flattens the suffix with " ".join(), so multi-paragraph text
+      // never string-matches — compare WORD SEQUENCES instead (both
+      // sides tokenize identically on \S+, proven against the daemon).
+      // A start that is not a word-suffix of what we show (a brand-new
+      // selection) supersedes any pending seek — the daemon restarted.
+      const isWordSuffix = (full, part) => {
+        const fw = full.match(/\S+/g) ?? [];
+        const pw = part.match(/\S+/g) ?? [];
+        if (!pw.length || pw.length > fw.length) return false;
+        for (let i = 0; i < pw.length; i++) {
+          if (fw[fw.length - pw.length + i] !== pw[i]) return false;
+        }
+        return true;
+      };
+      const pending = bridge.seekPending;
+      const isSeek = !!(pending && pending.gen === bridge.generation - 1 &&
+        text !== bridge.text && isWordSuffix(bridge.text, text));
+      bridge.seekPending = null;
+
+      if (isSeek) {
+        bridge.segment = text;
+        bridge.tokenBase = countWords(bridge.text) - countWords(text);
+        engine.setWords(toEngineWords(words, bridge.tokenBase));
+        anchorClock(0);
+        // The component is already "playing" from its own seek restart;
+        // re-speak the engine at the shifted base so its clock starts
+        // at the seeked word's startMs instead of running on.
+        engine.speak([], bridge.tokenBase);
+      } else {
+        bridge.text = text;
+        bridge.segment = text;
+        bridge.tokenBase = 0;
+        mountReader(text);
+        engine.setWords(toEngineWords(words, 0));
+        anchorClock(0);
+        reader.play();                          // speak(chunks) from word 0
+      }
+      setStatus("Reading…");
+      setLive(true);
+    };
+
+    const applyPlaying = (st) => {
+      trace(`playing ms=${st.ms} text=${st.text ? "y" : "n"} stale=${st.text && bridge.segment && st.text !== bridge.segment ? 1 : 0} gen=${bridge.generation}`);
+      if (typeof st.ms !== "number") return;
+      const text = st.text;
+      // Stale poll reply for the previous reading — drop it. Compares
+      // against the current SEGMENT (after a seek the daemon reports
+      // the suffix text, while bridge.text stays the full text).
+      if (text && bridge.segment && text !== bridge.segment) return;
+
+      // Mid-read join: page opened after "start" — mount from the
+      // playing payload itself and jump to the current position.
+      if (!reader && text) {
+        bridge.text = text;
+        bridge.segment = text;
+        bridge.tokenBase = 0;
+        mountReader(text);
+        engine.setWords(toEngineWords(Array.isArray(st.words) ? st.words : [], 0));
+        // A bare playing tail carries no word timings (the daemon sends
+        // words only while the list grows). Without timings the karaoke
+        // can't place the current word — seed PROVISIONAL uniform
+        // timings from the anchor word count so the page can at least
+        // advance; real timings replace them on the next growing poll.
+        if (!engine.words.length && text) {
+          const n = countWords(text);
+          const provisional = [];
+          for (let i = 0; i < n; i++) {
+            provisional.push([i + bridge.tokenBase, i * 260, (i + 1) * 260]);
+          }
+          engine.setWords(provisional);
+        }
+        reader.play();
+        anchorClock(st.ms);
+        engine.tick(st.ms);
+        setStatus("Reading…");
+        setLive(true);
+        return;
+      }
+      if (!engine || engine._stopped || engine._paused) return;
+      if (Array.isArray(st.words) && st.words.length) {
+        engine.setWords(toEngineWords(st.words, bridge.tokenBase));
+      }
+      anchorClock(st.ms);
+      engine.tick(st.ms);
+    };
+
+    const applyEnd = (label) => {
+      trace(`end(${label}) seekPending=${!!bridge.seekPending}`);
+      // A done/stop from the OLD playback can land while a seek POST is
+      // in flight — keep the reader mounted and wait for the new start.
+      if (bridge.seekPending) {
+        setStatus("Seeking…");
+        return;
+      }
+      bridge.generation++;
+      if (engine) engine.stop();
+      setLive(false);
+      setStatus(label);
+    };
+
+    let polling = false;
+    const poll = async () => {
+      if (bridge.frozen) return; // autotest receipt — hold the paused frame
+      if (polling) return; // one request in flight at a time
+      polling = true;
+      let st = null;
+      try {
+        const r = await fetch("/highlight_state", { cache: "no-store" });
+        st = await r.json();
+      } catch {
+        setLive(false);
+        return;
+      } finally {
+        polling = false;
+      }
+      if (!st || !st.state) {
+        setLive(false);
+        return;
+      }
+      switch (st.state) {
+        case "start":
+          applyStart(st);
+          setLive(true);
+          break;
+        case "playing":
+          if (!bridge.seekPending) applyPlaying(st);
+          setLive(true);
+          break;
+        case "stop":
+          applyEnd("Stopped");
+          break;
+        case "done":
+          applyEnd("Finished");
+          break;
+        default:
+          break; // "idle" — daemon between reads; nothing to do
+      }
+    };
+
+    // Smooth ticking between daemon polls: the daemon writes ~30ms but
+    // fetch round-trips jitter; re-derive elapsed from the last anchor
+    // + real-time delta. ExternalEngine's 250ms host-silence fallback
+    // covers daemon death mid-read.
+    const smoothTick = () => {
+      if (bridge.frozen) return; // receipt frame — never advance the clock
+      if (!engine || engine._stopped || engine._paused) return;
+      if (bridge.lastMsAt > 0) {
+        engine.tick(bridge.lastMs + (performance.now() - bridge.lastMsAt));
+      }
+    };
+
+    setInterval(poll, 30);
+    setInterval(smoothTick, 60);
+
+    // ?autotest=1 — deterministic headless verification mode. The mock
+    // server scripts the daemon's state sequence; the page self-drives:
+    // join -> advance -> seek -> re-anchor -> freeze, recording probe
+    // facts for the screenshot to capture.
+    if (new URLSearchParams(location.search).get("autotest") === "1") {
+      const facts = { started: false, seeked: false, paused: false, tok: -1, clock: -1, base: -1 };
+      window.__probe = facts;
+      const waitFor = (fn, ms = 10000) => new Promise((res) => {
+        const t0 = performance.now();
+        const iv = setInterval(() => {
+          if (fn() || performance.now() - t0 > ms) { clearInterval(iv); res(); }
+        }, 30);
+      });
+      (async () => {
+        // Wait for a live read with real timings (a provisional seed
+        // still counts — the seek POST is what matters).
+        await waitFor(() => !!reader && engine.words.length > 0 && bridge.text.length > 0);
+        facts.started = true;
+        // Position 3+ proves the clock advances; give it a full cycle.
+        await waitFor(() => engine.position >= 3, 12000);
+        // Seek only while the component is in playing state — a cycle
+        // teardown (done) between waits would make seekToToken a no-op.
+        if (reader.state !== "playing") {
+          await waitFor(() => reader.state === "playing", 12000);
+        }
+        reader.seekToToken(12);                    // exercises the real seek listener
+        // The mock's seek leg re-emits start with suffix text; the page
+        // shifts tokenBase and restarts. Wait for the shifted clock.
+        await waitFor(() => bridge.tokenBase === 12 && engine.position >= 12, 12000);
+        facts.seeked = true;
+        reader.pause();
+        facts.paused = true;
+        facts.tok = engine.position;
+        facts.clock = Math.round(engine._clock);
+        facts.base = bridge.tokenBase;
+        bridge.frozen = true;                 // hold this paused frame forever
+        probe.hidden = false;
+        probe.textContent =
+          `autotest started=${facts.started} seeked=${facts.seeked} paused=${facts.paused} ` +
+          `tok=${facts.tok} clock=${facts.clock} base=${facts.base} words=${engine.words.length}`;
+        // The headless screenshot camera fires at window load. A pending
+        // image request delays that event — hold the camera until the
+        // frozen receipt frame is on screen, then let it go.
+        try { await fetch("/autotest-hold", { method: "POST" }); } catch { /* camera cap: 30s */ }
+      })();
+    }
+  </script>
+</body>
+</html>

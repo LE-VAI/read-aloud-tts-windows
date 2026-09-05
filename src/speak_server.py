@@ -53,6 +53,12 @@ from speak import (
     setup_logging,
     voice_files_exist,
 )
+from overlay_server import (
+    OverlayServer,
+    file_request_sink,
+    file_state_source,
+    file_text_source,
+)
 
 # Piper is imported lazily (inside _load_voice / serve) so the pure-logic
 # functions (_compute_word_timings, _silence_bytes, chunk_text, etc.) can
@@ -547,6 +553,18 @@ def handle_speak(text: str, from_word: int = 0) -> dict[str, str]:
                         "words": all_word_timings,
                         "total_ms": round(chunk_offset_ms + chunk_duration_s * 1000.0),
                     })
+                    # Once-per-speak text sidecar: the tail of a long read
+                    # writes bare {"state":"playing","ms":...} (text rides
+                    # only while the word list grows), but a web overlay
+                    # page opened mid-read still needs the text to join.
+                    # The overlay server merges this sidecar into bare
+                    # playing states — one write per speak, not per 30ms.
+                    try:
+                        (_HIGHLIGHT_PATH.parent / "overlay_text.json").write_text(
+                            json.dumps({"text": text}), encoding="utf-8"
+                        )
+                    except OSError:
+                        pass
 
                 winsound.PlaySound(str(chunk_path), winsound.SND_FILENAME | winsound.SND_ASYNC)
                 if t_first_audio is None:
@@ -784,6 +802,28 @@ def serve() -> int:
     # Write a readiness marker so AHK knows the daemon is warm.
     ready_path = APP_DIR / "tmp" / "daemon_ready"
     ready_path.write_text("ready", encoding="utf-8")
+
+    # Web overlay viewer: a loopback HTTP thread serving the karaoke
+    # overlay page + component files, bridging the highlight state to
+    # HTTP and forwarding overlay clicks into the daemon's request file
+    # (the same file protocol the AHK UI uses). Viewer only — it owns
+    # no audio and can't block the daemon; a busy port or a missing
+    # component root just logs and carries on (hotkeys still work).
+    overlay_port = int(config.get("overlay_port", 8792))
+    overlay = OverlayServer(
+        state_source=file_state_source(_HIGHLIGHT_PATH),
+        text_source=file_text_source(APP_DIR / "tmp" / "overlay_text.json"),
+        request_sink=file_request_sink(APP_DIR / "tmp" / "request.json"),
+        component_root=Path(config.get("component_root", r"<component source>")),
+        highlight_color=config.get("highlight_color"),
+        host="127.0.0.1",
+        port=overlay_port,
+    )
+    if overlay.start():
+        logging.info("overlay viewer at http://127.0.0.1:%d/overlay", overlay_port)
+    else:
+        logging.warning("overlay viewer could not bind 127.0.0.1:%d "
+                        "(port busy?); hotkeys continue without it", overlay_port)
 
     # Start the keep-alive heartbeat thread. Belt-and-suspenders against
     # ORT #7449 thread-pool parking during long idle stretches.

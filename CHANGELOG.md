@@ -1,5 +1,46 @@
 # Changelog
 
+## Unreleased - Reading overlay (0.9.0)
+
+### Added
+- **Reading overlay — a karaoke viewer for the spoken text.** The daemon now
+  serves a loopback-only page at `http://127.0.0.1:<overlay_port>/overlay`
+  that renders the text being spoken with each word highlighted in place, in
+  a configurable color. It replaces the fixed Edit-control text box with a
+  real render: full text in place (not a copy in a small window), a
+  word-by-word highlight in the color of your choice (the legacy Edit
+  control's selection color was system-fixed and not recolorable), a soft
+  sentence tint, and **click any word to read from there** — the page sends
+  a seek back to the daemon, which restarts speech from that word, exactly
+  like the tray's restart. Opening the page mid-read joins the current
+  position. Speech is unaffected when the page is closed; hotkeys continue
+  if the port is busy.
+- Reuses the read-along web component in external-clock mode: the daemon
+  owns the audio and the clock (its 30ms `highlight_state.json` writes
+  become the word list and engine ticks), the page only renders. The HTTP
+  layer writes the same `request.json` protocol AutoHotkey uses — no new
+  daemon surface, and a once-per-speak `overlay_text.json` sidecar lets a
+  page opened during a read join mid-word-list.
+- New config keys: `overlay_port` (default 8792, loopback only),
+  `highlight_color` (default `#FFC400`; served as plain `rgb()` — exotic
+  color functions can silently drop inside `::highlight()` paint rules),
+  `component_root` (the read-along component directory; a fixed whitelist
+  is served from it).
+- `src/overlay_mock.py` — a scripted mock daemon that drives the same state
+  protocol without Piper, for UI testing and screenshots.
+- `?autotest=1` self-driving verification mode: the page joins, advances,
+  seeks to word 12, freezes the receipt frame, and holds the browser's
+  load event until the frame is ready — so a headless screenshot
+  deterministically captures the final probe line
+  (`autotest started=true seeked=true paused=true tok=12 … base=12`).
+
+### Fixed
+- **The invisible-highlight trap, caught in verification:** the overlay
+  initially served the component without its `read-along.css`, so
+  registered `::highlight()` ranges had no paint rule — ranges present,
+  nothing painted, no error anywhere. The stylesheet link is now part of
+  the served page (the component's shadow template deliberately ships no
+  `::highlight()` rules; host pages must load them).
 
 ## 0.8.2 - Voice-switch reliability (2026-08-30)
 

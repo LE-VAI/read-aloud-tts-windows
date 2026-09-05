@@ -8,6 +8,9 @@
   "length_scale": 1.2,
   "noise_scale": 0.4,
   "noise_w": 0.3,
+  "overlay_port": 8792,
+  "highlight_color": "#FFC400",
+  "component_root": "D:\\the workspace\\read-along\\src",
   "voices": {
     "en_US-lessac-medium": {
       "label": "Lessac - warm",

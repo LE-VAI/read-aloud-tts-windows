@@ -115,6 +115,51 @@ powershell -NoProfile -ExecutionPolicy Bypass -File .\uninstall.ps1 -RemoveAppDa
 3. Press `F6` to stop speech.
 4. Use the tray menu to read, stop, change voice, open config, or open logs.
 
+## Reading overlay
+
+The daemon also serves a **karaoke viewer** page — the spoken text with each
+word highlighted as it is spoken, in place, with a configurable highlight
+color. With the daemon running, open:
+
+```
+http://127.0.0.1:8792/overlay
+```
+
+Loopback-only (never exposed to the network) and synchronized to the same
+word-timing state the legacy overlay consumed. What it adds over a fixed
+text box:
+
+- **In-place rendering** of the full text — not a copy in a small window.
+- **Word-by-word highlight** in your color of choice (see `highlight_color`
+  below), plus a soft sentence tint under the active sentence.
+- **Click any word to read from there** — the page sends a seek back to the
+  daemon, which restarts speech from that word and the highlight re-anchors.
+- **Join mid-read** — open the page any time during a read; it picks up the
+  current text and position.
+
+The overlay reuses the [read-along](../read-along) web component in
+external-clock mode: the daemon owns the audio and the clock, the page only
+renders. If the page is closed, speech is unaffected.
+
+| Key | Default | Effect |
+| --- | --- | --- |
+| `overlay_port` | `8792` | Port the viewer serves on (127.0.0.1 only). A busy port disables the viewer with a log line — hotkeys and speech continue without it. |
+| `highlight_color` | `#FFC400` | Hex color for the active-word highlight (any `#RGB`/`#RRGGBB`). Served as plain `rgb()` values — exotic color functions can silently drop inside `::highlight()` paint rules. |
+| `component_root` | `<component source>` | Where the read-along component files live. The server serves a fixed whitelist from this root only. |
+
+A mock daemon (`src/overlay_mock.py`) drives the same state protocol without
+Piper — useful for testing the overlay UI and for screenshots:
+
+```
+python src/overlay_mock.py 8793          # then open http://127.0.0.1:8793/overlay
+python src/overlay_mock.py 8793 --duration 30
+```
+
+`?autotest=1` on the overlay URL self-drives the full flow (join → advance →
+seek → freeze) and holds the page's load event until the frozen receipt
+frame is ready, so a headless screenshot captures the final state with the
+probe line (`autotest started=… seeked=… base=…`).
+
 ## Tuning speech cadence
 
 After install, `config.json` (in the app folder, copied from `config.example.json`) includes optional keys that control how Piper speaks. Edit the file and restart the helper for changes to take effect.
