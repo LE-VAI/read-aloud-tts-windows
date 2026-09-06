@@ -12,6 +12,9 @@ real HTTP against a live in-process server instance.
 import json
 import struct
 import sys
+import threading
+import time
+import urllib.error
 import urllib.request
 from pathlib import Path
 
@@ -237,6 +240,97 @@ def test_http_stop_forwards_stop_request(tmp_path):
         status, _ = h.post("/stop", {})
         assert status == 200
         assert h.requests == [{"action": "stop"}]
+    finally:
+        h.stop()
+
+
+# ---------------------------------------------------------------------------
+# cross-site guard
+# ---------------------------------------------------------------------------
+
+def test_http_rejects_foreign_host(tmp_path):
+    # DNS-rebinding: a Host header that isn't loopback must get 403 on
+    # both GET and POST before any route logic runs.
+    h = _Harness(tmp_path)
+    try:
+        req = urllib.request.Request(h.base + "/highlight_state")
+        req.add_header("Host", "evil.example.com")
+        try:
+            urllib.request.urlopen(req, timeout=5)
+            assert False, "expected 403"
+        except urllib.error.HTTPError as e:
+            assert e.code == 403
+        req = urllib.request.Request(
+            h.base + "/seek", data=b'{"text":"x"}', method="POST",
+            headers={"Content-Type": "application/json", "Host": "evil.example.com"},
+        )
+        try:
+            urllib.request.urlopen(req, timeout=5)
+            assert False, "expected 403"
+        except urllib.error.HTTPError as e:
+            assert e.code == 403
+        assert h.requests == []
+    finally:
+        h.stop()
+
+
+def test_http_rejects_cross_site_origin(tmp_path):
+    # A malicious page's fetch carries Origin: http://evil.example — no
+    # CORS preflight needed for a text/plain POST, so Origin alone must
+    # block it.
+    h = _Harness(tmp_path)
+    try:
+        req = urllib.request.Request(
+            h.base + "/seek", data=json.dumps({"text": "x"}).encode(),
+            method="POST",
+            headers={"Content-Type": "text/plain",
+                     "Origin": "http://evil.example"},
+        )
+        try:
+            urllib.request.urlopen(req, timeout=5)
+            assert False, "expected 403"
+        except urllib.error.HTTPError as e:
+            assert e.code == 403
+        assert h.requests == []
+        # Same-origin still passes (Origin: http://127.0.0.1:PORT).
+        status, _ = h.post("/seek", {"text": "w0 w1", "from_word": 1})
+        assert status == 200
+        assert h.requests == [{"action": "speak", "text": "w0 w1", "from_word": 1}]
+    finally:
+        h.stop()
+
+
+def test_http_allows_originless_tooling(tmp_path):
+    # curl / urllib / the AHK host send no Origin — must stay open.
+    h = _Harness(tmp_path)
+    try:
+        status, _ = h.get("/highlight_state")
+        assert status == 200
+    finally:
+        h.stop()
+
+
+# ---------------------------------------------------------------------------
+# autotest-hold re-arm
+# ---------------------------------------------------------------------------
+
+def test_http_autotest_hold_rearms(tmp_path):
+    # Second hold in the same server lifetime must block again (clear +
+    # wait), so a re-run screenshot doesn't fall through instantly.
+    h = _Harness(tmp_path)
+    try:
+        h.server._hold_released.set()  # simulate a completed first run
+        status: list = []
+        threading.Thread(
+            target=lambda: status.append(h.get("/autotest-hold")), daemon=True
+        ).start()
+        time.sleep(0.5)  # the hold must still be blocking here
+        assert not status, "hold released instantly — re-arm missing"
+        h.server._hold_released.set()  # release like the page's POST does
+        deadline = time.time() + 5
+        while not status and time.time() < deadline:
+            time.sleep(0.05)
+        assert status and status[0][0] == 204
     finally:
         h.stop()
 

@@ -103,6 +103,8 @@
     const bridge = {
       generation: 0,     // bumped per mounted read; stale replies dropped
       seekPending: null, // {word, gen} while a seek's new start is in flight
+      seekTimer: 0,      // debounce handle — the last word clicked wins
+      lastSeekAt: 0,     // performance.now() of the last accepted seek click
       text: "",          // full text currently rendered
       segment: "",       // text of the current start payload (suffix after seek)
       tokenBase: 0,       // shift: daemon word index -> component token index
@@ -152,12 +154,29 @@
       el.addEventListener("seek", async (ev) => {
         const tok = ev.detail?.token?.token ?? ev.detail?.token ?? -1;
         if (typeof tok !== "number" || tok < 0) return;
+        // Debounce: each click restarts daemon synthesis, so rapid taps
+        // stutter the audio — 250ms since the last click wins instead.
+        const now = performance.now();
+        if (now - bridge.lastSeekAt < 250) return;
+        bridge.lastSeekAt = now;
         bridge.seekPending = { word: tok, gen: bridge.generation };
         // Re-anchor the local clock to the seeked word so smooth
         // ticking advances from the click, not from the old read's ms.
         const hit = engine.words.find(([t]) => t === tok);
         if (hit) anchorClock(hit[1]);
         setStatus("Seeking…");
+        // A daemon that can't fulfill the seek (from_word past the end,
+        // voice load failure) clears its state and never emits a new
+        // start — recover instead of polling "Seeking…" forever.
+        const gen = bridge.generation;
+        clearTimeout(bridge.seekTimer);
+        bridge.seekTimer = setTimeout(() => {
+          if (bridge.seekPending && bridge.seekPending.gen === gen) {
+            bridge.seekPending = null;
+            setStatus("Seek did not start — click again or re-read");
+            setLive(false);
+          }
+        }, 4000);
         try {
           await fetch("/seek", {
             method: "POST",
@@ -166,6 +185,7 @@
           });
         } catch {
           bridge.seekPending = null;
+          clearTimeout(bridge.seekTimer);
           setStatus("Seek failed — daemon unreachable");
         }
       });
@@ -221,6 +241,7 @@
       const isSeek = !!(pending && pending.gen === bridge.generation - 1 &&
         text !== bridge.text && isWordSuffix(bridge.text, text));
       bridge.seekPending = null;
+      clearTimeout(bridge.seekTimer); // seek succeeded — cancel recovery
 
       if (isSeek) {
         bridge.segment = text;
@@ -304,6 +325,7 @@
     };
 
     let polling = false;
+    let pollFailStreak = 0; // consecutive failed polls — dead-daemon detector
     const poll = async () => {
       if (bridge.frozen) return; // autotest receipt — hold the paused frame
       if (polling) return; // one request in flight at a time
@@ -314,10 +336,12 @@
         st = await r.json();
       } catch {
         setLive(false);
+        if (++pollFailStreak === 10) setStatus("Connection lost — retrying");
         return;
       } finally {
         polling = false;
       }
+      pollFailStreak = 0;
       if (!st || !st.state) {
         setLive(false);
         return;
@@ -344,13 +368,20 @@
 
     // Smooth ticking between daemon polls: the daemon writes ~30ms but
     // fetch round-trips jitter; re-derive elapsed from the last anchor
-    // + real-time delta. ExternalEngine's 250ms host-silence fallback
-    // covers daemon death mid-read.
+    // + real-time delta. The delta is CAPPED: the daemon writes nothing
+    // during inter-chunk pauses (0.3s) and slow chunk re-synths, so an
+    // uncapped clock would race the highlight into words the audio
+    // hasn't reached, then snap back when playback resumes. 400ms of
+    // grace covers poll jitter + device-open latency; beyond that the
+    // highlight holds at the last word until the daemon catches up.
+    const SMOOTH_CAP_MS = 400;
     const smoothTick = () => {
       if (bridge.frozen) return; // receipt frame — never advance the clock
       if (!engine || engine._stopped || engine._paused) return;
       if (bridge.lastMsAt > 0) {
-        engine.tick(bridge.lastMs + (performance.now() - bridge.lastMsAt));
+        const delta = Math.min(
+          performance.now() - bridge.lastMsAt, SMOOTH_CAP_MS);
+        engine.tick(bridge.lastMs + delta);
       }
     };
 

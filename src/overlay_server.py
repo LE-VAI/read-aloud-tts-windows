@@ -232,7 +232,44 @@ class OverlayServer:
                 self.end_headers()
                 self.wfile.write(body)
 
+            # Cross-site guard: the server is loopback-only, but any web
+            # page the user browses can also reach 127.0.0.1 — a simple
+            # text/plain POST needs no CORS preflight, so /seek and /stop
+            # would otherwise be drivable from random sites (and DNS
+            # rebinding gives full reach). Only same-origin (or
+            # origin-less tooling) passes; everything else gets 403.
+            def _reject_cross_site(self) -> bool:
+                host = (self.headers.get("Host") or "").lower()
+                if not host.startswith(("127.0.0.1", "localhost")):
+                    self._drain_body()
+                    self._send(403, "text/plain; charset=utf-8", b"forbidden host")
+                    return True
+                origin = (self.headers.get("Origin") or "").strip()
+                if origin and not origin.lower().startswith(
+                    ("http://127.0.0.1", "http://localhost")
+                ):
+                    self._drain_body()
+                    self._send(403, "text/plain; charset=utf-8", b"forbidden origin")
+                    return True
+                return False
+
+            def _drain_body(self) -> None:
+                # Consume the request body before 403ing: closing with
+                # unread data makes Windows send RST and the client sees
+                # a connection abort instead of the 403 response.
+                try:
+                    length = int(self.headers.get("Content-Length") or 0)
+                except ValueError:
+                    length = 0
+                if 0 < length <= MAX_POST_BYTES:
+                    try:
+                        self.rfile.read(length)
+                    except OSError:
+                        pass
+
             def do_GET(self):
+                if self._reject_cross_site():
+                    return
                 path = self.path.split("?", 1)[0]
                 if path == "/overlay":
                     try:
@@ -247,7 +284,11 @@ class OverlayServer:
                 elif path == "/autotest-hold":
                     # Long-poll up to 30s: the autotest page's <img> holds
                     # window.load (the headless camera's trigger) until the
-                    # flow completes and it POSTs the release.
+                    # flow completes and it POSTs the release. Re-arm on
+                    # every new hold request so a second autotest run in
+                    # the same daemon lifetime blocks again instead of
+                    # falling through instantly.
+                    server._hold_released.clear()
                     server._hold_released.wait(timeout=30.0)
                     self._send(204, "text/plain; charset=utf-8", b"")
                 elif path.startswith("/component/"):
@@ -258,6 +299,8 @@ class OverlayServer:
                     self._send(404, "text/plain; charset=utf-8", b"not found")
 
             def do_POST(self):
+                if self._reject_cross_site():
+                    return
                 path = self.path.split("?", 1)[0]
                 length = int(self.headers.get("Content-Length") or 0)
                 if length < 0 or length > MAX_POST_BYTES:
