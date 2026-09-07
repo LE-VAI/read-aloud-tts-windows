@@ -509,7 +509,10 @@ SpeakViaDaemon(text) {
     FileAppend req, RequestPath, "UTF-8-RAW"
     ; Start the highlight overlay timer only when enabled (opt-in).
     if ShowOverlayEnabled() {
+        DebugLog "SpeakViaDaemon: overlay enabled, starting tick timer"
         StartHighlightTimer()
+    } else {
+        DebugLog "SpeakViaDaemon: overlay DISABLED in config"
     }
     ; Wait for the response (up to 120s for long text). The daemon replies
     ; "Speak started" immediately after spawning the playback worker; an
@@ -818,6 +821,7 @@ HighlightTick() {
     }
     ; Parse the single-line JSON state.
     state := JsonGet(raw, "state")
+    DebugLog "Tick state=" . state . " len=" . StrLen(raw)
     if (state = "start") {
         HighlightOnStart(raw)
     } else if (state = "playing") {
@@ -863,6 +867,9 @@ HighlightOnStart(raw) {
     ; Parse words: [["word",start_ms,end_ms],...]
     HighlightWords := ParseWordTimings(raw)
     HighlightPlayStart := A_TickCount
+    DebugLog "OnStart: gui=" . (HighlightGui != "" ? "exists" : "new")
+        . " words=" . HighlightWords.Length . " textLen=" . StrLen(text)
+        . " sameText=" . (text = HighlightFullText)
     if (HighlightGui != "" and text = HighlightFullText) {
         ; SEEK-RESUME, not a new read: the daemon now sends the FULL text
         ; with zero-timed prefix words on seeks (hover-resume /
@@ -925,6 +932,7 @@ HighlightOnPlaying(raw) {
 
 HighlightOnStop() {
     global HighlightPaused, HighlightCurrentIdx, HighlightFullText
+    DebugLog "OnStop: paused=" . HighlightPaused . " hadText=" . (HighlightFullText != "")
     StopHighlightTimer()
     ; Finished reads leave a small Replay bar instead of nothing: the last
     ; text stays one click away (replay-from-finished), no re-select needed.
@@ -1008,6 +1016,22 @@ ShowHighlightOverlay(text) {
     global HighlightGui, HighlightFullText, gLastSelStart, gLastSelEnd, gOverlayDpi
     global gHoverInside, gHoverLeftAt, gHoverPauseRequested, gHoverResumeRequested
     global HighlightPaused, HighlightCurrentIdx, HighlightLastColored, gOverlayReducedMotion
+    DebugLog "ShowHighlightOverlay entry: textLen=" . StrLen(text)
+    try {
+        ShowHighlightOverlayInner(text)
+    } catch as e {
+        ; A throw mid-build (the NumPut("Str") class of bug) used to abort
+        ; the auto-execute thread SILENTLY: daemon spoke, tick ran, no
+        ; panel, nothing logged. Log every build failure loudly now.
+        DebugLog "ShowHighlightOverlay FAILED: " . e.Message . " @ " . e.What
+        HighlightGui := ""
+    }
+}
+
+ShowHighlightOverlayInner(text) {
+    global HighlightGui, HighlightFullText, gLastSelStart, gLastSelEnd, gOverlayDpi
+    global gHoverInside, gHoverLeftAt, gHoverPauseRequested, gHoverResumeRequested
+    global HighlightPaused, HighlightCurrentIdx, HighlightLastColored, gOverlayReducedMotion
     HideReplayBar()   ; a new read supersedes the finished-read replay bar
     HideHighlightOverlay()
     HighlightFullText := text
@@ -1070,6 +1094,7 @@ ShowHighlightOverlay(text) {
     ; (we never rely on selection persistence).
     reStyle := "ClassRichEdit50W +0x50000804 -Tabstop -VScroll w" . (panelWidth - Round(36 * dpiScale)) . " h" . (panelHeight - Round(28 * dpiScale))
     reCtrl := HighlightGui.AddCustom(reStyle)
+    DebugLog "  AddCustom ok hwnd=" . reCtrl.Hwnd
     ; --- RichEdit init (research gotchas, in order) ---
     reHwnd := reCtrl.Hwnd
     ; EM_SETUNDOLIMIT 0: per-word recoloring creates undo records at 3+/s
@@ -1085,16 +1110,19 @@ ShowHighlightOverlay(text) {
     stx := Buffer(8, 0)
     NumPut("UInt", 0, stx, 0)
     NumPut("UInt", 1200, stx, 4)
-    SendMessage(0x0461, stx.Ptr, StrPtr(text), reHwnd)
+    setTextRet := SendMessage(0x0461, stx.Ptr, StrPtr(text), reHwnd)
+    DebugLog "  EM_SETTEXTEX ret=" . setTextRet
     ; Set font + size + base color document-wide: EM_SETCHARFORMAT
     ; SCF_ALL (0x4 — NOT 0x8, which is SCF_USEUIRULES) with CFM_FACE|
     ; CFM_SIZE|CFM_COLOR. yHeight is TWIPS (points x 20): 16pt-class
     ; readable body = 320 twips (scaled by DPI at build time).
     cf := MakeCharFormat(0x20000000 | 0x80000000 | 0x40000000, 0, Round(320 * dpiScale), 0xE8E8E8, fontName)
-    SendMessage(0x0444, 4, cf.Ptr, reHwnd)
+    docFmtRet := SendMessage(0x0444, 4, cf.Ptr, reHwnd)
+    DebugLog "  EM_SETCHARFORMAT(SCF_ALL) ret=" . docFmtRet
     ; Word-wrap on, no horizontal scrollbar — text flows.
     SendMessage(0x00C4, 0, 0, reHwnd)   ; EM_SETFMTLINES off; wrap is default in RichEdit
     HighlightGui.Show("x" . panelX . " y" . panelY . " w" . panelWidth . " h" . panelHeight . " NA")
+    DebugLog "  Gui.Show ok x=" . panelX . " y=" . panelY . " w=" . panelWidth . " h=" . panelHeight . " hwnd=" . HighlightGui.Hwnd
     ; Windows 11 polish via DWM (research packet area 3). All wrapped in
     ; try — attribute 33/38 need Win11; failure falls back to square/dark.
     hwnd := HighlightGui.Hwnd
@@ -1111,6 +1139,7 @@ ShowHighlightOverlay(text) {
     ; Opacity 243/255: near-opaque (guarantees 4.5:1 text contrast
     ; worst-case, unlike the old 220) while keeping a subtle blend.
     SetTranslucent(hwnd, 243)
+    DebugLog "  ShowHighlightOverlay BUILD COMPLETE"
 }
 
 ; Build a zero-initialized CHARFORMAT2W (116 bytes, pack(4) — offsets
