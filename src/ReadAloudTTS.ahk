@@ -901,7 +901,19 @@ HighlightOnPlaying(raw) {
         ; from the once-per-speak sidecar the daemon writes for the web
         ; overlay. Without this the box appears EMPTY (no text at all).
         if (text = "") {
-            try text := FileRead(AppDir . "tmp\overlay_text.json", "UTF-8")
+            ; Sidecar fallback when a bare "playing" packet raced past the
+            ; held "start" window. Path needs the backslash (AppDir carries
+            ; no trailing slash — the original AppDir . "tmp\..." resolved
+            ; to "...\ReadAloudTTS tmp\..." and FileRead always threw into
+            ; the swallow), and the sidecar is JSON — extract the text
+            ; value, never display the raw {"text": ...} wrapper.
+            try {
+                sidecar := FileRead(AppDir . "\tmp\overlay_text.json", "UTF-8")
+                sidecarText := JsonGet(sidecar, "text")
+                if (sidecarText != "") {
+                    text := sidecarText
+                }
+            }
         }
         ShowHighlightOverlay(text)
     }
@@ -1020,10 +1032,14 @@ ShowHighlightOverlay(text) {
     try {
         ShowHighlightOverlayInner(text)
     } catch as e {
-        ; A throw mid-build (the NumPut("Str") class of bug) used to abort
-        ; the auto-execute thread SILENTLY: daemon spoke, tick ran, no
-        ; panel, nothing logged. Log every build failure loudly now.
+        ; A throw mid-build (the NumPut("Str") / EM_GETLINE-with-NULL class
+        ; of bug) used to abort the thread SILENTLY: daemon spoke, tick ran,
+        ; no panel, nothing logged. Log every build failure loudly now, and
+        ; DESTROY the half-built Gui — HighlightOnPlaying sees gui="" and
+        ; retries, so a persistent failure would otherwise leak one Gui
+        ; object per tick (693 leaked in the first live catch of this).
         DebugLog "ShowHighlightOverlay FAILED: " . e.Message . " @ " . e.What
+        try HighlightGui.Destroy()
         HighlightGui := ""
     }
 }
@@ -1119,8 +1135,11 @@ ShowHighlightOverlayInner(text) {
     cf := MakeCharFormat(0x20000000 | 0x80000000 | 0x40000000, 0, Round(320 * dpiScale), 0xE8E8E8, fontName)
     docFmtRet := SendMessage(0x0444, 4, cf.Ptr, reHwnd)
     DebugLog "  EM_SETCHARFORMAT(SCF_ALL) ret=" . docFmtRet
-    ; Word-wrap on, no horizontal scrollbar — text flows.
-    SendMessage(0x00C4, 0, 0, reHwnd)   ; EM_SETFMTLINES off; wrap is default in RichEdit
+    ; Word-wrap is ON by default in RichEdit — no EM_FMTLINES call needed
+    ; (and NEVER send 0x00C4: that is EM_GETLINE, whose lParam must be a
+    ; buffer with capacity in the first word — lParam=0 makes the control
+    ; write to NULL and AHK throws OSError, silently killing every live
+    ; panel build; caught live 2026-09-07 after 693 failed rebuilds).
     HighlightGui.Show("x" . panelX . " y" . panelY . " w" . panelWidth . " h" . panelHeight . " NA")
     DebugLog "  Gui.Show ok x=" . panelX . " y=" . panelY . " w=" . panelWidth . " h=" . panelHeight . " hwnd=" . HighlightGui.Hwnd
     ; Windows 11 polish via DWM (research packet area 3). All wrapped in
