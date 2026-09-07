@@ -1122,8 +1122,13 @@ MakeCharFormat(mask, effects, yHeightTwips, bgrColor, faceName) {
     NumPut("UInt", mask, cf, 4)          ; dwMask
     NumPut("UInt", effects, cf, 8)       ; dwEffects (0 for explicit color!)
     NumPut("Int", yHeightTwips, cf, 12)  ; yHeight (twips)
-    NumPut("UInt", bgrColor, cf, 20)     ; crTextColor (0x00BBGGRR)
-    NumPut("Str", faceName, cf, 26, "UTF-16")  ; szFaceName[32]
+    NumPut("UInt", bgrColor, cf, 20)    ; crTextColor (0x00BBGGRR)
+    ; szFaceName[32] at byte 26. AHK v2 has NO string NumPut — NumPut("Str",...)
+    ; throws "Invalid parameter(s)" at runtime (the /Validate harness does not
+    ; catch it, and in the production script the try-less throw aborts the
+    ; auto-execute thread, silently killing the overlay build). The correct
+    ; idiom is StrPut against a raw pointer: StrPut(str, buf.Ptr + offset).
+    StrPut(faceName, cf.Ptr + 26, "UTF-16")
     return cf
 }
 
