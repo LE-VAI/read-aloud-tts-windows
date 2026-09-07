@@ -2,6 +2,12 @@
 #SingleInstance Force
 Persistent
 
+; RichEdit 4.1 (msftedit.dll) hosts the reading overlay: per-word text
+; COLORING instead of the classic Edit's blue selection block. MUST load
+; the DLL before creating any RichEdit50W control (SDK: msftedit.dll is
+; the only module that registers the class).
+#DllLoad Msftedit.dll
+
 SetWorkingDir A_ScriptDir
 
 global AppDir := A_ScriptDir
@@ -27,8 +33,11 @@ global HighlightTotalMs := 0
 global HighlightPlayStart := 0
 global HighlightTimer := ""
 global HighlightCurrentIdx := -1
+global HighlightLastColored := -1
 global HighlightPaused := false
 global HighlightFullText := ""
+global gSeekInFlight := false
+global gOverlayReducedMotion := false
 global TranscriptGui := ""
 global ReplayGui := ""
 ; Last cursor position — used by HighlightTick to require mouse MOVEMENT
@@ -738,7 +747,7 @@ StopHighlightTimer() {
 HighlightTick() {
     global HighlightGui, HighlightPaused, gLastMouseX, gLastMouseY
     global gHoverInside, gHoverLeftAt, gHoverPauseRequested, gHoverResumeRequested
-    global gLastActionAt
+    global gLastActionAt, gSeekInFlight
     ; Critical 50: serialize this tick against hotkeys/OnMessage for up to
     ; 50ms — the 30ms timer, WM_LBUTTONDOWN handler and hover logic all
     ; mutate shared state and AHK preempts a timer thread by default
@@ -821,7 +830,11 @@ HighlightTick() {
         ; disappear" bug, and the dead timer then stranded
         ; HighlightPaused=true into the NEXT read, whose hover machine
         ; resumed from a stale word index (mid-paragraph restarts).
-        if (!HighlightPaused) {
+        ; Same for a seek-in-flight (click-to-rewind / hover-resume /
+        ; Space): the stop + the old worker's late "done" land BEFORE the
+        ; new speak's "start" — treating them as terminal tears the box
+        ; down mid-seek and the in-place resume path never engages.
+        if (!HighlightPaused and !gSeekInFlight) {
             HighlightOnStop()
         }
     }
@@ -839,6 +852,11 @@ IsMouseOverOverlay() {
 HighlightOnStart(raw) {
     global HighlightWords, HighlightTotalMs, HighlightPlayStart
     global HighlightGui, HighlightCurrentIdx, HighlightFullText
+    global gSeekInFlight
+    ; The new speak's start packet arrived — terminal-state suppression
+    ; (gSeekInFlight) is no longer needed; from here the daemon's states
+    ; are genuine again.
+    gSeekInFlight := false
     text := JsonGet(raw, "text")
     totalMs := JsonGet(raw, "total_ms")
     HighlightTotalMs := (totalMs != "") ? Round(totalMs) : 0
@@ -902,13 +920,6 @@ HighlightOnPlaying(raw) {
     if (idx >= 0 and idx != HighlightCurrentIdx) {
         HighlightCurrentIdx := idx
         SelectOverlayWord(idx)
-    } else if (idx >= 0 and HighlightGui != "") {
-        ; Same word, but this may be right after a seek-resume where the
-        ; panel was just updated in place — ensure the word is scrolled
-        ; into view once (EM_SETSEL already moved the caret; the control
-        ; hides the selection, so send EM_SCROLLCARET to bring the word
-        ; into view when the text is longer than the box).
-        try SendMessage(0x448, 0, 0, HighlightGui["Edit1"])
     }
 }
 
@@ -996,7 +1007,7 @@ ToggleOverlayEnabled() {
 ShowHighlightOverlay(text) {
     global HighlightGui, HighlightFullText, gLastSelStart, gLastSelEnd, gOverlayDpi
     global gHoverInside, gHoverLeftAt, gHoverPauseRequested, gHoverResumeRequested
-    global HighlightPaused, HighlightCurrentIdx
+    global HighlightPaused, HighlightCurrentIdx, HighlightLastColored, gOverlayReducedMotion
     HideReplayBar()   ; a new read supersedes the finished-read replay bar
     HideHighlightOverlay()
     HighlightFullText := text
@@ -1008,6 +1019,7 @@ ShowHighlightOverlay(text) {
     ; text mid-paragraph (stale HighlightCurrentIdx against fresh words).
     HighlightPaused := false
     HighlightCurrentIdx := -1
+    HighlightLastColored := -1
     gLastSelStart := -1
     gLastSelEnd := -1
     gHoverInside := false
@@ -1018,7 +1030,7 @@ ShowHighlightOverlay(text) {
     ; Do NOT use +E0x20 (WS_EX_TRANSPARENT) — it makes the window invisible
     ; to mouse events, which would break hover-pause and click-to-rewind.
     HighlightGui := Gui("+AlwaysOnTop -Caption +ToolWindow +E0x08000000")
-    HighlightGui.BackColor := "1a1a2e"
+    HighlightGui.BackColor := "16161D"
     ; DPI-aware geometry: AHK v2 is not per-monitor DPI aware by default;
     ; scale the panel/font from the primary monitor's DPI at build time.
     try DllCall("SetProcessDpiAwarenessContext", "ptr", -4, "int")
@@ -1028,47 +1040,91 @@ ShowHighlightOverlay(text) {
         gOverlayDpi := 96
     }
     dpiScale := gOverlayDpi / 96.0
-    HighlightGui.SetFont("s" . Round(12 * dpiScale), "Segoe UI")
+    gOverlayReducedMotion := !ReducedMotionEnabled()
+    ; Typography (Apple HIG x Material 3 contract + ChatGPT teardown):
+    ; 16px-class body type (weight 400, generous leading) — the old
+    ; s12 panel forced a lean-in to read the highlight (user
+    ; complaint). Segoe UI Variable is the Win11 system stack; falls
+    ; back to Segoe UI on older builds. Font must be set via
+    ; CHARFORMAT so the RichEdit honors it, but SetFont on the Gui first
+    ; gives the fallback a baseline.
+    fontName := "Segoe UI Variable Text"
+    HighlightGui.SetFont("s" . Round(13 * dpiScale), fontName)
     ; Near-opaque dark panel (research: composited text on translucent
     ; panels fails WCAG 4.5:1 worst-case; 243/255 ≈ 95% keeps a whisper
-    ; of depth while guaranteeing contrast), ~50% of screen width,
-    ; bottom-center.
+    ; of depth while guaranteeing contrast), ~52% of screen width,
+    ; bottom-center. Taller than the old 80px strip: two lines of 16px
+    ; text plus comfortable padding (Gemini/ChatGPT composer feel).
     screenWidth := A_ScreenWidth
-    panelWidth := Round(screenWidth * 0.5 * dpiScale)
-    panelHeight := Round(80 * dpiScale)
+    panelWidth := Round(screenWidth * 0.52)
+    panelHeight := Round(108 * dpiScale)
     panelX := Round((screenWidth - panelWidth) / 2)
-    panelY := A_ScreenHeight - panelHeight - Round(60 * dpiScale)
-    HighlightGui.MarginX := Round(16 * dpiScale)
-    HighlightGui.MarginY := Round(12 * dpiScale)
-    ; -E0x200 removes WS_EX_TRANSPARENT from the Edit control too.
-    ; +0x100 = ES_NOHIDESEL: keep the selection VISIBLE when the control
-    ; doesn't have focus. The window is WS_EX_NOACTIVATE and never takes
-    ; focus, so without this style EM_SETSEL ran every 30ms invisibly.
-    editCtrl := HighlightGui.Add("Edit", "w" . (panelWidth - Round(32 * dpiScale)) . " h" . (panelHeight - Round(24 * dpiScale)) . " -VScroll +0x100 cWhite Background1a1a2e", text)
-    ; NOTE: hover-pause is implemented by the movement-gated state machine
-    ; in HighlightTick — Gui.OnEvent("MouseMove", ...) is INVALID in AHK v2
-    ; (valid events are Close/Escape/Size/ContextMenu/DropFiles) and threw
-    ; "Parameter #1 of Gui.Prototype.OnEvent is invalid" on every read.
-    ; Click-to-rewind uses OnMessage(WM_LBUTTONDOWN), registered ONCE in the
-    ; auto-execute section — registering per-overlay-build stacked handlers.
+    panelY := A_ScreenHeight - panelHeight - Round(56 * dpiScale)
+    HighlightGui.MarginX := Round(18 * dpiScale)
+    HighlightGui.MarginY := Round(14 * dpiScale)
+    ; RichEdit50W styles (verified vs MS SDK richedit.h + AHK shipping
+    ; examples): WS_CHILD|WS_VISIBLE (0x50000000) + ES_MULTILINE|ES_READONLY
+    ; (0x804). Deliberately NO ES_NOHIDESEL: on this never-focused panel
+    ; the selection stays INVISIBLE by default — the visible signal is
+    ; the amber word color, not a selection block. ES_SAVESEL not needed
+    ; (we never rely on selection persistence).
+    reStyle := "ClassRichEdit50W +0x50000804 -Tabstop -VScroll w" . (panelWidth - Round(36 * dpiScale)) . " h" . (panelHeight - Round(28 * dpiScale))
+    reCtrl := HighlightGui.AddCustom(reStyle)
+    ; --- RichEdit init (research gotchas, in order) ---
+    reHwnd := reCtrl.Hwnd
+    ; EM_SETUNDOLIMIT 0: per-word recoloring creates undo records at 3+/s
+    ; — pollute nothing on a display-only surface.
+    SendMessage(0x0452, 0, 0, reHwnd)
+    ; EM_SETBKGNDCOLOR: dark surface matching the panel (BGR 0x1D1616).
+    SendMessage(0x0443, 0, 0x1D1616, reHwnd)
+    ; EM_EXLIMITTEXT: RichEdit's default ~32K would truncate long reads.
+    SendMessage(0x0435, 0, 0x7FFFFFFE, reHwnd)
+    ; EM_SETTEXTEX (0x0461): SETTEXTEX{flags=ST_DEFAULT, codepage=1200
+    ; (Unicode)}; returns 1 on success. Research: the documented RichEdit
+    ; path with a real success return (unlike WM_SETTEXT).
+    stx := Buffer(8, 0)
+    NumPut("UInt", 0, stx, 0)
+    NumPut("UInt", 1200, stx, 4)
+    SendMessage(0x0461, stx.Ptr, StrPtr(text), reHwnd)
+    ; Set font + size + base color document-wide: EM_SETCHARFORMAT
+    ; SCF_ALL (0x4 — NOT 0x8, which is SCF_USEUIRULES) with CFM_FACE|
+    ; CFM_SIZE|CFM_COLOR. yHeight is TWIPS (points x 20): 16pt-class
+    ; readable body = 320 twips (scaled by DPI at build time).
+    cf := MakeCharFormat(0x20000000 | 0x80000000 | 0x40000000, 0, Round(320 * dpiScale), 0xE8E8E8, fontName)
+    SendMessage(0x0444, 4, cf.Ptr, reHwnd)
+    ; Word-wrap on, no horizontal scrollbar — text flows.
+    SendMessage(0x00C4, 0, 0, reHwnd)   ; EM_SETFMTLINES off; wrap is default in RichEdit
     HighlightGui.Show("x" . panelX . " y" . panelY . " w" . panelWidth . " h" . panelHeight . " NA")
     ; Windows 11 polish via DWM (research packet area 3). All wrapped in
     ; try — attribute 33/38 need Win11; failure falls back to square/dark.
     hwnd := HighlightGui.Hwnd
-    ; DWMWA_WINDOW_CORNER_PREFERENCE (33) = DWMWCP_ROUNDSMALL (3): the
-    ; menu-style corner, right for an auxiliary HUD. NOTE: incompatible
-    ; with per-pixel-alpha layering — we use SetTranslucent (alpha blend
-    ; via SetLayeredWindowAttributes), which is compatible.
-    try DllCall("dwmapi\DwmSetWindowAttribute", "ptr", hwnd, "uint", 33, "int*", 3, "uint", 4)
+    ; DWMWA_WINDOW_CORNER_PREFERENCE (33) = DWMWCP_ROUND (2): the
+    ; card/dialog radius — 12px-class per the design contract.
+    try DllCall("dwmapi\DwmSetWindowAttribute", "ptr", hwnd, "uint", 33, "int*", 2, "uint", 4)
     ; DWMWA_USE_IMMERSIVE_DARK_MODE (20): dark chrome if a border ever shows.
     try DllCall("dwmapi\DwmSetWindowAttribute", "ptr", hwnd, "uint", 20, "int*", 1, "uint", 4)
-    ; DWMWA_SYSTEMBACKDROP_TYPE (38) = DWMSBT_TRANSIENTWINDOW (3): acrylic
-    ; backdrop on Win11 22H2+. Needs the frame extended into the client.
-    try DllCall("dwmapi\DwmExtendFrameIntoClientArea", "ptr", hwnd, "int*", -1)
-    try DllCall("dwmapi\DwmSetWindowAttribute", "ptr", hwnd, "uint", 38, "int*", 3, "uint", 4)
+    ; When the user has reduced motion on, force-disable DWM window
+    ; transitions for this surface (contract #18).
+    if (gOverlayReducedMotion) {
+        try DllCall("dwmapi\DwmSetWindowAttribute", "ptr", hwnd, "uint", 3, "int*", 1, "uint", 4)
+    }
     ; Opacity 243/255: near-opaque (guarantees 4.5:1 text contrast
     ; worst-case, unlike the old 220) while keeping a subtle blend.
     SetTranslucent(hwnd, 243)
+}
+
+; Build a zero-initialized CHARFORMAT2W (116 bytes, pack(4) — offsets
+; verified against MS SDK richedit.h). Zero-init is mandatory: a garbage
+; dwMask silently misformats (documented SO failure mode).
+MakeCharFormat(mask, effects, yHeightTwips, bgrColor, faceName) {
+    cf := Buffer(116, 0)
+    NumPut("UInt", 116, cf, 0)          ; cbSize
+    NumPut("UInt", mask, cf, 4)          ; dwMask
+    NumPut("UInt", effects, cf, 8)       ; dwEffects (0 for explicit color!)
+    NumPut("Int", yHeightTwips, cf, 12)  ; yHeight (twips)
+    NumPut("UInt", bgrColor, cf, 20)     ; crTextColor (0x00BBGGRR)
+    NumPut("Str", faceName, cf, 26, "UTF-16")  ; szFaceName[32]
+    return cf
 }
 
 OverlayHoverPause(*) {
@@ -1133,10 +1189,13 @@ OverlayClickHandler(wParam, lParam, msg, hwnd) {
     if (HighlightGui = "") {
         return
     }
-    ; Get the character position under the cursor via EM_CHARFROMPOS = 0xD7.
+    ; Click-to-rewind on the RichEdit surface. EM_CHARFROMPOS on RichEdit
+    ; is 0x427 (WM_USER+39) — NOT the classic Edit's 0xD7 — and takes a
+    ; pointer to a POINT struct, returning the flat char index (not the
+    ; packed low-word of the classic Edit).
     ctrlHwnd := 0
     try {
-        ctrl := HighlightGui["Edit1"]
+        ctrl := HighlightGui["RichEdit50W1"]
         if IsObject(ctrl) {
             ctrlHwnd := ctrl.Hwnd
         }
@@ -1149,9 +1208,12 @@ OverlayClickHandler(wParam, lParam, msg, hwnd) {
     ; lParam has the client coordinates (low word = x, high word = y).
     px := lParam & 0xFFFF
     py := (lParam >> 16) & 0xFFFF
-    ; EM_CHARFROMPOS returns char index in low word, line in high word.
-    charIdx := SendMessage(0xD7, 0, (py << 16) | px, ctrlHwnd)
-    charIdx := charIdx & 0xFFFF
+    pt := Buffer(8, 0)
+    NumPut("Int", px, pt, 0)
+    NumPut("Int", py, pt, 4)
+    charIdx := SendMessage(0x0427, 0, pt.Ptr, ctrlHwnd)
+    ; RichEdit returns the flat char index (up to 0x7FFFFFFE — no low-word
+    ; mask, unlike the classic Edit's packed return).
     ; Find which word this char belongs to.
     idx := FindWordByChar(HighlightWords, charIdx)
     if (idx >= 0) {
@@ -1227,7 +1289,7 @@ FindWordByChar(words, charIdx) {
 
 SeekFromWord(idx) {
     global HighlightFullText, RequestPath, ResponsePath, HighlightPath
-    global HighlightCurrentIdx
+    global HighlightCurrentIdx, gSeekInFlight
     HighlightCurrentIdx := idx
     ; Stop current playback.
     StopSpeechDaemon()
@@ -1239,6 +1301,13 @@ SeekFromWord(idx) {
     jsonText := JsonEscape(HighlightFullText)
     req := '{"action":"speak","text":"' . jsonText . '","from_word":' . idx . '}'
     FileAppend req, RequestPath, "UTF-8-RAW"
+    ; The daemon writes {"state":"stop"} (seek's StopSpeechDaemon) and a
+    ; late {"state":"done"} (the old playback worker exiting) — both
+    ; BEFORE the new speak's "start" packet. An un-gated tick would run
+    ; HighlightOnStop on them: the box flashes away, the timer dies, and
+    ; the in-place seek-resume never engages. Suppress terminal states
+    ; until the new "start" packet lands (HighlightOnStart clears it).
+    gSeekInFlight := true
     ; Restart the highlight timer (only when the overlay is enabled).
     if ShowOverlayEnabled() {
         StartHighlightTimer()
@@ -1254,13 +1323,49 @@ StopSpeechDaemon() {
     }
 }
 
+; --- Per-word karaoke coloring (RichEdit) ----------------------------------
+; The visible reading signal is a calm amber word — NOT a selection block.
+; Flow per tick when the word changes: recolor PREVIOUS word back to the
+; base color, color CURRENT word amber, EM_SCROLLCARET (0xB7) to follow.
+; Research gotchas honored: alternate two DIFFERENT structs (resending
+; byte-identical params TOGGLES the effect), EM_EXSETSEL wParam MUST be 0,
+; dwEffects stays 0 (CFE_AUTOCOLOR would override the explicit color),
+; never SCF_ALL per tick.
+global gCfAmber := ""
+global gCfBase := ""
+
+EnsureCharFormatPair(faceName) {
+    global gCfAmber, gCfBase, gOverlayDpi
+    dpiScale := gOverlayDpi / 96.0
+    if (gCfAmber = "") {
+        ; Amber #FFC400 -> BGR 0x00C4FF (matches the web overlay's
+        ; highlight_color and the tray accent). CFM_COLOR only —
+        ; recoloring must not touch size/face metrics (no reflow).
+        gCfAmber := MakeCharFormat(0x40000000, 0, Round(320 * dpiScale), 0x00C4FF, faceName)
+        ; Base text #E8E8E8 -> BGR 0x00E8E8E8 (the BGR triple must be
+        ; fully spelled out: 0x00E8E8 would be #E8E800 yellow-green).
+        gCfBase := MakeCharFormat(0x40000000, 0, Round(320 * dpiScale), 0x00E8E8E8, faceName)
+    }
+}
+
+ColorWordRange(reHwnd, charStart, charEnd, cf) {
+    ; EM_EXSETSEL (0x437): wParam MUST be 0, lParam = CHARRANGE.
+    cr := Buffer(8, 0)
+    NumPut("Int", charStart, cr, 0)
+    NumPut("Int", charEnd, cr, 4)
+    SendMessage(0x0437, 0, cr.Ptr, reHwnd)
+    ; EM_SETCHARFORMAT (0x444) SCF_SELECTION (1). Returns nonzero on
+    ; success — 0 means the format silently failed (validate!).
+    return SendMessage(0x0444, 1, cf.Ptr, reHwnd)
+}
+
 SelectOverlayWord(idx) {
     global HighlightGui, HighlightWords, gLastSelStart, gLastSelEnd
+    global HighlightLastColored, gOverlayDpi
     if HighlightGui = "" {
         return
     }
     ; Calculate character offset of word idx in the full text.
-    ; We use the stored word start/end offsets computed at parse time.
     wordInfo := HighlightWords[idx + 1]  ; AHK arrays are 1-based
     if !IsObject(wordInfo) {
         return
@@ -1270,26 +1375,35 @@ SelectOverlayWord(idx) {
     if (charStart < 0 or charEnd < 0) {
         return
     }
-    ; CHANGE-GATED: EM_SETSEL every 30ms invalidates the control even when
-    ; the selection is identical — a redraw storm that starves WM_PAINT
-    ; (the flicker/freeze root cause from the research packet). Touch the
-    ; control only when the selection actually changes.
+    ; CHANGE-GATED: recolor only when the word actually changes — a
+    ; per-tick EM_SETCHARFORMAT storm starves WM_PAINT (the original
+    ; flicker root cause), and the same params RESENT would TOGGLE the
+    ; color off (documented RichEdit behavior).
     if (charStart = gLastSelStart and charEnd = gLastSelEnd) {
         return
     }
     gLastSelStart := charStart
     gLastSelEnd := charEnd
-    ; Select the current word (highlight). EM_SETSEL = 0xB1.
-    ; Find the Edit control.
+    EnsureCharFormatPair("Segoe UI Variable Text")
     try {
-        ctrl := HighlightGui["Edit1"]
-        if IsObject(ctrl) {
-            SendMessage(0xB1, charStart, charEnd, ctrl)
-        }
+        reCtrl := HighlightGui["RichEdit50W1"]
+        reHwnd := reCtrl.Hwnd
     } catch {
-        ; Fallback: use window handle.
-        SendMessage 0xB1, charStart, charEnd, "Edit1", "ahk_id " . HighlightGui.Hwnd
+        return
     }
+    ; Recolor the PREVIOUS word back to base first.
+    if (HighlightLastColored >= 0 and HighlightLastColored <= HighlightWords.Length - 1) {
+        prev := HighlightWords[HighlightLastColored + 1]
+        if (prev[4] >= 0 and prev[5] >= 0) {
+            ColorWordRange(reHwnd, prev[4], prev[5], gCfBase)
+        }
+    }
+    ; Color the current word amber + scroll it into view (EM_SCROLLCARET
+    ; 0xB7 — NOT 0x448, which is EM_SETTARGETDEVICE and would change
+    ; word-wrap layout).
+    ColorWordRange(reHwnd, charStart, charEnd, gCfAmber)
+    SendMessage(0x00B7, 0, 0, reHwnd)
+    HighlightLastColored := idx
 }
 
 HideHighlightOverlay() {
