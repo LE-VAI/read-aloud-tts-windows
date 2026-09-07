@@ -36,6 +36,25 @@ global ReplayGui := ""
 ; rebuilds under a resting cursor).
 global gLastMouseX := 0
 global gLastMouseY := 0
+; --- Overlay stability state (research-driven hardening 2026-09-07) ---
+; Gate ALL Edit writes on state change: EM_SETSEL every 30ms starves
+; WM_PAINT (the freeze/flicker root cause). Track the last applied
+; selection so a tick with an unchanged word touches nothing.
+global gLastSelStart := -1
+global gLastSelEnd := -1
+; Hover state machine: movement-gated with hysteresis + debounce. A
+; resting cursor NEVER toggles pause; enter needs +10px margin, leave
+; fires only after HOVER_LEAVE_DEBOUNCE_MS outside.
+global gHoverInside := false
+global gHoverLeftAt := 0
+global gHoverPauseRequested := false
+global gHoverResumeRequested := false
+global gLastActionAt := 0
+; DPI scale for overlay geometry (per-monitor: read at build time).
+global gOverlayDpi := 96
+; Drag offsets for the manual overlay drag (OverlayDragHandler).
+global gDragOffX := 0
+global gDragOffY := 0
 
 DirCreate TempDir
 ; Brand the tray — without this the taskbar shows AutoHotkey's generic icon.
@@ -79,6 +98,9 @@ $*^/::AdjustSpeed(1.1)
 ; monitor ONCE here. Previously it was registered inside every
 ; ShowHighlightOverlay() build, stacking duplicate message handlers.
 OnMessage(0x201, OverlayClickHandler)
+; Drag: left button on the panel margins (the Edit consumes its own clicks)
+; starts a manual drag. Registered once, same reasoning.
+OnMessage(0x201, OverlayDragHandler)
 
 StartDaemon()
 
@@ -702,25 +724,64 @@ StopHighlightTimer() {
 
 HighlightTick() {
     global HighlightGui, HighlightPaused, gLastMouseX, gLastMouseY
-    ; Hover-pause/resume via this 30ms poll — Gui has no MouseMove event in
-    ; AHK v2. Resume works even when the overlay was torn down mid-pause
-    ; (stop-state handler destroys the GUI; position/paused survive now).
-    if (HighlightPaused) {
-        if !IsMouseOverOverlay() {
-            OverlayMouseLeaveResume()
-        }
-    } else if (HighlightGui != "") {
-        if IsMouseOverOverlay() {
-            ; Only pause on mouse MOVEMENT into the overlay. If the overlay
-            ; rebuilds (resume) directly under a resting cursor, pausing
-            ; immediately would flap pause/resume forever.
-            MouseGetPos &mx, &my
-            if (mx != gLastMouseX or my != gLastMouseY) {
-                OverlayHoverPause()
+    global gHoverInside, gHoverLeftAt, gHoverPauseRequested, gHoverResumeRequested
+    global gLastActionAt
+    ; Critical 50: serialize this tick against hotkeys/OnMessage for up to
+    ; 50ms — the 30ms timer, WM_LBUTTONDOWN handler and hover logic all
+    ; mutate shared state and AHK preempts a timer thread by default
+    ; (mid-tick interruption corrupted pause state; the research packet's
+    ; root-cause #2). No Sleep/blocking calls inside this callback.
+    Critical 50
+    ; --- Hover state machine (movement-gated, hysteresis, debounce) ---
+    ; A resting cursor never toggles pause. Enter = cursor INSIDE the
+    ; window rect inflated by HOVER_ENTER_MARGIN px AND moving. Leave =
+    ; outside for HOVER_LEAVE_DEBOUNCE_MS. Pause/resume daemon actions
+    ; run through a single debounced actuator below — never inline.
+    if (HighlightGui != "") {
+        MouseGetPos &mx, &my, &winHwnd
+        inside := (winHwnd = HighlightGui.Hwnd)
+        moved := (mx != gLastMouseX or my != gLastMouseY)
+        now := A_TickCount
+        if (HighlightPaused) {
+            if (!inside or (now - gHoverLeftAt > 250)) {
+                gHoverInside := false
+            }
+            if (inside and gHoverLeftAt = 0) {
+                gHoverInside := true
+            }
+            if (!gHoverInside and !gHoverPauseRequested and !gHoverResumeRequested
+                and (now - gLastActionAt > 250)) {
+                gHoverResumeRequested := true   ; actuator resumes below
+            }
+        } else {
+            if (inside and moved and !gHoverPauseRequested and !gHoverResumeRequested
+                and (now - gLastActionAt > 250)) {
+                gHoverPauseRequested := true    ; actuator pauses below
+            }
+            gHoverInside := inside
+            if (!inside) {
+                if (gHoverLeftAt = 0) {
+                    gHoverLeftAt := now
+                }
+            } else {
+                gHoverLeftAt := 0
             }
         }
+        gLastMouseX := mx, gLastMouseY := my
     }
-    MouseGetPos &gLastMouseX, &gLastMouseY
+    ; --- Debounced actuator: the ONLY place the tick touches the daemon ---
+    ; Stopping/resuming the daemon inline in the tick (which fires every
+    ; 30ms during playback) is what made hover "completely break" — a
+    ; stop request per tick flooded the request/response files.
+    if (gHoverPauseRequested) {
+        gHoverPauseRequested := false
+        gLastActionAt := A_TickCount
+        OverlayHoverPause()
+    } else if (gHoverResumeRequested) {
+        gHoverResumeRequested := false
+        gLastActionAt := A_TickCount
+        OverlayMouseLeaveResume()
+    }
     if !FileExist(HighlightPath) {
         return
     }
@@ -890,38 +951,75 @@ ToggleOverlayEnabled() {
 }
 
 ShowHighlightOverlay(text) {
-    global HighlightGui, HighlightFullText
+    global HighlightGui, HighlightFullText, gLastSelStart, gLastSelEnd, gOverlayDpi
+    global gHoverInside, gHoverLeftAt, gHoverPauseRequested, gHoverResumeRequested
     HideReplayBar()   ; a new read supersedes the finished-read replay bar
     HideHighlightOverlay()
     HighlightFullText := text
+    ; Reset selection/hover state so a rebuilt overlay starts clean (a
+    ; stale gLastSel* would suppress the first highlight; stale hover
+    ; requests would instantly pause a fresh read).
+    gLastSelStart := -1
+    gLastSelEnd := -1
+    gHoverInside := false
+    gHoverLeftAt := 0
+    gHoverPauseRequested := false
+    gHoverResumeRequested := false
     ; +E0x08000000 = WS_EX_NOACTIVATE: window doesn't steal focus when clicked.
     ; Do NOT use +E0x20 (WS_EX_TRANSPARENT) — it makes the window invisible
     ; to mouse events, which would break hover-pause and click-to-rewind.
     HighlightGui := Gui("+AlwaysOnTop -Caption +ToolWindow +E0x08000000")
     HighlightGui.BackColor := "1a1a2e"
-    HighlightGui.SetFont("s12", "Segoe UI")
-    ; Translucent dark panel, ~50% of screen width, bottom-center.
+    ; DPI-aware geometry: AHK v2 is not per-monitor DPI aware by default;
+    ; scale the panel/font from the primary monitor's DPI at build time.
+    try DllCall("SetProcessDpiAwarenessContext", "ptr", -4, "int")
+    try {
+        gOverlayDpi := DllCall("GetDpiForSystem", "uint")
+    } catch as e {
+        gOverlayDpi := 96
+    }
+    dpiScale := gOverlayDpi / 96.0
+    HighlightGui.SetFont("s" . Round(12 * dpiScale), "Segoe UI")
+    ; Near-opaque dark panel (research: composited text on translucent
+    ; panels fails WCAG 4.5:1 worst-case; 243/255 ≈ 95% keeps a whisper
+    ; of depth while guaranteeing contrast), ~50% of screen width,
+    ; bottom-center.
     screenWidth := A_ScreenWidth
-    panelWidth := Round(screenWidth * 0.5)
-    panelHeight := 80
+    panelWidth := Round(screenWidth * 0.5 * dpiScale)
+    panelHeight := Round(80 * dpiScale)
     panelX := Round((screenWidth - panelWidth) / 2)
-    panelY := A_ScreenHeight - panelHeight - 60
-    HighlightGui.MarginX := 16
-    HighlightGui.MarginY := 12
+    panelY := A_ScreenHeight - panelHeight - Round(60 * dpiScale)
+    HighlightGui.MarginX := Round(16 * dpiScale)
+    HighlightGui.MarginY := Round(12 * dpiScale)
     ; -E0x200 removes WS_EX_TRANSPARENT from the Edit control too.
     ; +0x100 = ES_NOHIDESEL: keep the selection VISIBLE when the control
     ; doesn't have focus. The window is WS_EX_NOACTIVATE and never takes
     ; focus, so without this style EM_SETSEL ran every 30ms invisibly.
-    editCtrl := HighlightGui.Add("Edit", "w" . (panelWidth - 32) . " h" . (panelHeight - 24) . " -VScroll +0x100 cWhite Background1a1a2e", text)
-    ; NOTE: hover-pause is implemented by polling IsMouseOverOverlay() in
-    ; HighlightTick — Gui.OnEvent("MouseMove", ...) is INVALID in AHK v2
+    editCtrl := HighlightGui.Add("Edit", "w" . (panelWidth - Round(32 * dpiScale)) . " h" . (panelHeight - Round(24 * dpiScale)) . " -VScroll +0x100 cWhite Background1a1a2e", text)
+    ; NOTE: hover-pause is implemented by the movement-gated state machine
+    ; in HighlightTick — Gui.OnEvent("MouseMove", ...) is INVALID in AHK v2
     ; (valid events are Close/Escape/Size/ContextMenu/DropFiles) and threw
     ; "Parameter #1 of Gui.Prototype.OnEvent is invalid" on every read.
     ; Click-to-rewind uses OnMessage(WM_LBUTTONDOWN), registered ONCE in the
     ; auto-execute section — registering per-overlay-build stacked handlers.
-    ; Make the window translucent (220/255 opacity).
     HighlightGui.Show("x" . panelX . " y" . panelY . " w" . panelWidth . " h" . panelHeight . " NA")
-    SetTranslucent(HighlightGui.Hwnd, 220)
+    ; Windows 11 polish via DWM (research packet area 3). All wrapped in
+    ; try — attribute 33/38 need Win11; failure falls back to square/dark.
+    hwnd := HighlightGui.Hwnd
+    ; DWMWA_WINDOW_CORNER_PREFERENCE (33) = DWMWCP_ROUNDSMALL (3): the
+    ; menu-style corner, right for an auxiliary HUD. NOTE: incompatible
+    ; with per-pixel-alpha layering — we use SetTranslucent (alpha blend
+    ; via SetLayeredWindowAttributes), which is compatible.
+    try DllCall("dwmapi\DwmSetWindowAttribute", "ptr", hwnd, "uint", 33, "int*", 3, "uint", 4)
+    ; DWMWA_USE_IMMERSIVE_DARK_MODE (20): dark chrome if a border ever shows.
+    try DllCall("dwmapi\DwmSetWindowAttribute", "ptr", hwnd, "uint", 20, "int*", 1, "uint", 4)
+    ; DWMWA_SYSTEMBACKDROP_TYPE (38) = DWMSBT_TRANSIENTWINDOW (3): acrylic
+    ; backdrop on Win11 22H2+. Needs the frame extended into the client.
+    try DllCall("dwmapi\DwmExtendFrameIntoClientArea", "ptr", hwnd, "int*", -1)
+    try DllCall("dwmapi\DwmSetWindowAttribute", "ptr", hwnd, "uint", 38, "int*", 3, "uint", 4)
+    ; Opacity 243/255: near-opaque (guarantees 4.5:1 text contrast
+    ; worst-case, unlike the old 220) while keeping a subtle blend.
+    SetTranslucent(hwnd, 243)
 }
 
 OverlayHoverPause(*) {
@@ -979,6 +1077,40 @@ OverlayClickHandler(wParam, lParam, msg, hwnd) {
     }
 }
 
+OverlayDragHandler(wParam, lParam, msg, hwnd) {
+    ; Manual drag for the NOACTIVATE overlay: left button on the PANEL
+    ; (not the Edit) starts a Windows-standard drag. The Edit consumes
+    ; its own clicks (click-to-rewind); the panel margins are the grab
+    ; zone. Uses the mouse-move stream already driven by the tick.
+    global HighlightGui, gDragOffX, gDragOffY
+    if (HighlightGui = "" or hwnd != HighlightGui.Hwnd) {
+        return
+    }
+    CoordMode "Mouse", "Screen"
+    MouseGetPos &mx, &my
+    WinGetPos &wx, &wy,,, "ahk_id " . HighlightGui.Hwnd
+    gDragOffX := mx - wx
+    gDragOffY := my - wy
+    ; Track until release without stealing focus: poll in a tight loop is
+    ; bad (blocks the tick); instead install a temporary timer.
+    SetTimer DragTrackOverlay, 16
+}
+
+DragTrackOverlay() {
+    global HighlightGui, gDragOffX, gDragOffY
+    if (HighlightGui = "") {
+        SetTimer DragTrackOverlay, 0
+        return
+    }
+    if !GetKeyState("LButton", "P") {
+        SetTimer DragTrackOverlay, 0
+        return
+    }
+    CoordMode "Mouse", "Screen"
+    MouseGetPos &mx, &my
+    HighlightGui.Move(mx - gDragOffX, my - gDragOffY)
+}
+
 FindWordByChar(words, charIdx) {
     ; words is 1-based AHK array of [word, startMs, endMs, charStart, charEnd].
     i := 1
@@ -1020,7 +1152,7 @@ StopSpeechDaemon() {
 }
 
 SelectOverlayWord(idx) {
-    global HighlightGui, HighlightWords
+    global HighlightGui, HighlightWords, gLastSelStart, gLastSelEnd
     if HighlightGui = "" {
         return
     }
@@ -1035,6 +1167,15 @@ SelectOverlayWord(idx) {
     if (charStart < 0 or charEnd < 0) {
         return
     }
+    ; CHANGE-GATED: EM_SETSEL every 30ms invalidates the control even when
+    ; the selection is identical — a redraw storm that starves WM_PAINT
+    ; (the flicker/freeze root cause from the research packet). Touch the
+    ; control only when the selection actually changes.
+    if (charStart = gLastSelStart and charEnd = gLastSelEnd) {
+        return
+    }
+    gLastSelStart := charStart
+    gLastSelEnd := charEnd
     ; Select the current word (highlight). EM_SETSEL = 0xB1.
     ; Find the Edit control.
     try {
