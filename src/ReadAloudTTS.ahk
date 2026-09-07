@@ -85,6 +85,12 @@ $*F6::StopSpeech()
 
 $*^!t::ShowTranscript()
 
+; Space = play/pause for the reading overlay (design contract #14: hover
+; is a convenience, never the only control path — WCAG 1.4.13). Toggles
+; pause while the overlay is reading; resumes when paused. Bound only
+; when the overlay exists so normal Space typing elsewhere is untouched.
+$*Space::OverlaySpaceKey()
+
 ; Speed control — on-the-fly rate adjustment.
 ;   Ctrl + * (Ctrl+Shift+8) = faster  (multiply = more speed)
 ;   Ctrl + /                = slower  (divide = less speed)
@@ -1049,6 +1055,23 @@ OverlayHoverPause(*) {
     HighlightPaused := true
     ; Stop the daemon playback (it will remember nothing — resume re-sends text from current word).
     StopSpeechDaemon()
+}
+
+; Space-key play/pause (keyboard alternative to hover — WCAG 1.4.13 /
+; design contract #14). Only intercepts Space while the reading overlay
+; is on screen; every other context types normally.
+OverlaySpaceKey() {
+    global HighlightGui, HighlightPaused, HighlightCurrentIdx, HighlightFullText
+    if (HighlightGui = "") {
+        ; No overlay: pass Space through untouched.
+        Send "{Space}"
+        return
+    }
+    if (!HighlightPaused) {
+        OverlayHoverPause()
+    } else {
+        OverlayMouseLeaveResume()
+    }
 }
 
 OverlayMouseLeaveResume(*) {
