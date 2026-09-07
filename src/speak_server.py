@@ -411,12 +411,27 @@ def handle_speak(text: str, from_word: int = 0) -> dict[str, str]:
         return {"status": "error", "message": "No text to speak"}
 
     # If from_word is set, skip the first N words (click-to-rewind).
+    # BUT the highlight overlay must keep showing the FULL text (the box
+    # must not shrink/reset on every rewind or hover-resume). So: slice
+    # what is SPOKEN, but keep full_text + a from_word offset so the
+    # word-timing packet can be padded back to full-document shape (the
+    # overlay's start packet carries the full text and a word list whose
+    # first from_word entries are zero-timed). A second click-to-rewind on
+    # the still-visible box then sends an index into the SAME full text —
+    # repeated rewinds stay word-accurate instead of re-slicing an
+    # already-sliced remainder (the double-rewind drift bug).
+    full_text = text
+    from_word_offset = 0
     if from_word > 0:
         words = text.split()
         if from_word >= len(words):
             return {"status": "ok", "message": "Already at end"}
+        full_text = text
+        from_word_offset = from_word
         text = " ".join(words[from_word:])
-        logging.info("Seeking from word %s, remaining: %s chars", from_word, len(text))
+        logging.info(
+            "Seeking from word %s, remaining: %s chars", from_word, len(text)
+        )
 
     chunks = chunk_text(text, chunk_chars, first_chunk_chars=first_chunk_chars)
     sentence_silence = float(config.get("sentence_silence", 0.5))
@@ -499,6 +514,19 @@ def handle_speak(text: str, from_word: int = 0) -> dict[str, str]:
                     # thread so we can start audio as fast as possible.
                     wav_bytes, total_samples, sample_rate = synth_chunk(chunk)
                     wtimings = _compute_word_timings(chunk, total_samples, sample_rate)
+                    # Pad the word list back to full-document shape when this
+                    # is a seek (from_word > 0): the first from_word_offset
+                    # entries get zero-timed placeholders so the overlay's
+                    # word index N maps to the same word as the full text.
+                    # Without this, a click-to-rewind packet's word list
+                    # started at the remainder, the overlay rebuilt showing
+                    # ONLY the remainder, and a second rewind re-sliced an
+                    # already-sliced text (double-rewind drift).
+                    if from_word_offset > 0:
+                        prefix_words = full_text.split()[:from_word_offset]
+                        wtimings = [
+                            [w, 0.0, 0.0] for w in prefix_words
+                        ] + wtimings
                     for wt in wtimings:
                         wt[1] = round(wt[1] + chunk_offset_ms, 1)
                         wt[2] = round(wt[2] + chunk_offset_ms, 1)
@@ -549,7 +577,7 @@ def handle_speak(text: str, from_word: int = 0) -> dict[str, str]:
                     written_words_count = len(all_word_timings)
                     _write_highlight_state({
                         "state": "start",
-                        "text": text,
+                        "text": full_text,
                         "words": all_word_timings,
                         "total_ms": round(chunk_offset_ms + chunk_duration_s * 1000.0),
                     })
@@ -561,7 +589,7 @@ def handle_speak(text: str, from_word: int = 0) -> dict[str, str]:
                     # playing states — one write per speak, not per 30ms.
                     try:
                         (_HIGHLIGHT_PATH.parent / "overlay_text.json").write_text(
-                            json.dumps({"text": text}), encoding="utf-8"
+                            json.dumps({"text": full_text}), encoding="utf-8"
                         )
                     except OSError:
                         pass
@@ -592,7 +620,7 @@ def handle_speak(text: str, from_word: int = 0) -> dict[str, str]:
                     if time.time() < hold_start_until:
                         _write_highlight_state({
                             "state": "start",
-                            "text": text,
+                            "text": full_text,
                             "words": all_word_timings,
                             "total_ms": round(chunk_offset_ms + chunk_duration_s * 1000.0),
                         })
@@ -603,7 +631,7 @@ def handle_speak(text: str, from_word: int = 0) -> dict[str, str]:
                         _write_highlight_state({
                             "state": "playing",
                             "ms": round(elapsed_ms, 1),
-                            "text": text,
+                            "text": full_text,
                             "words": all_word_timings,
                         })
                     else:

@@ -55,6 +55,9 @@ global gOverlayDpi := 96
 ; Drag offsets for the manual overlay drag (OverlayDragHandler).
 global gDragOffX := 0
 global gDragOffY := 0
+global gDragStartX := 0
+global gDragStartY := 0
+global gDragMoved := false
 
 DirCreate TempDir
 ; Brand the tray — without this the taskbar shows AutoHotkey's generic icon.
@@ -835,12 +838,23 @@ IsMouseOverOverlay() {
 
 HighlightOnStart(raw) {
     global HighlightWords, HighlightTotalMs, HighlightPlayStart
+    global HighlightGui, HighlightCurrentIdx, HighlightFullText
     text := JsonGet(raw, "text")
     totalMs := JsonGet(raw, "total_ms")
     HighlightTotalMs := (totalMs != "") ? Round(totalMs) : 0
     ; Parse words: [["word",start_ms,end_ms],...]
     HighlightWords := ParseWordTimings(raw)
     HighlightPlayStart := A_TickCount
+    if (HighlightGui != "" and text = HighlightFullText) {
+        ; SEEK-RESUME, not a new read: the daemon now sends the FULL text
+        ; with zero-timed prefix words on seeks (hover-resume /
+        ; click-to-rewind / Space). Rebuilding here was the jumpiness:
+        ; the box flickered, lost its dragged position, and reset
+        ; selection state. Update words/timers in place — same panel,
+        ; same position, highlight just continues from the new packet.
+        HighlightCurrentIdx := -1
+        return
+    }
     ShowHighlightOverlay(text)
 }
 
@@ -873,6 +887,9 @@ HighlightOnPlaying(raw) {
     ; The daemon appends word timings per chunk during playback. When the
     ; payload carries a words array larger than what we parsed, refresh —
     ; this lets the overlay highlight ahead into not-yet-played chunks.
+    ; NOTE: on seek-resumes the daemon sends the FULL word list (with a
+    ; zero-timed prefix) from packet one, so this refresh also picks up
+    ; the complete list immediately after a rewind.
     if RegExMatch(raw, '"words"\s*:\s*\[') {
         newWords := ParseWordTimings(raw)
         if (newWords.Length > HighlightWords.Length) {
@@ -882,9 +899,16 @@ HighlightOnPlaying(raw) {
     elapsed := Round(msStr)
     ; Find the word whose [start_ms, end_ms) contains elapsed.
     idx := FindWordIndex(HighlightWords, elapsed)
-    if (idx >= 0) {
+    if (idx >= 0 and idx != HighlightCurrentIdx) {
         HighlightCurrentIdx := idx
         SelectOverlayWord(idx)
+    } else if (idx >= 0 and HighlightGui != "") {
+        ; Same word, but this may be right after a seek-resume where the
+        ; panel was just updated in place — ensure the word is scrolled
+        ; into view once (EM_SETSEL already moved the caret; the control
+        ; hides the selection, so send EM_SCROLLCARET to bring the word
+        ; into view when the text is longer than the box).
+        try SendMessage(0x448, 0, 0, HighlightGui["Edit1"])
     }
 }
 
@@ -1058,25 +1082,39 @@ OverlayHoverPause(*) {
 }
 
 ; Space-key play/pause (keyboard alternative to hover — WCAG 1.4.13 /
-; design contract #14). Only intercepts Space while the reading overlay
-; is on screen; every other context types normally.
+; design contract #14). The overlay is WS_EX_NOACTIVATE, so the user's
+; real focus stays wherever it was — meaning a blind "no overlay →
+; passthrough / overlay → toggle" split is WRONG: with the overlay up
+; during a long read, Space typed into ANY other window (chat, editor,
+; browser) would toggle playback instead of typing a space. Gate the
+; toggle on the overlay itself being the active context: either the
+; pointer is inside the panel, or the focused window IS the panel
+; (covers the tray/other activation paths). Every other context passes
+; Space through untouched.
 OverlaySpaceKey() {
-    global HighlightGui, HighlightPaused, HighlightCurrentIdx, HighlightFullText
-    if (HighlightGui = "") {
-        ; No overlay: pass Space through untouched.
-        Send "{Space}"
+    global HighlightGui, HighlightPaused
+    if (HighlightGui != "" and (IsMouseOverOverlay() or WinActive("ahk_id " . HighlightGui.Hwnd))) {
+        if (!HighlightPaused) {
+            OverlayHoverPause()
+        } else {
+            OverlayMouseLeaveResume()
+        }
         return
     }
-    if (!HighlightPaused) {
-        OverlayHoverPause()
-    } else {
-        OverlayMouseLeaveResume()
-    }
+    Send "{Space}"
 }
 
 OverlayMouseLeaveResume(*) {
-    global HighlightPaused, HighlightCurrentIdx, HighlightFullText
+    global HighlightPaused, HighlightCurrentIdx, HighlightFullText, HighlightGui
     if (!HighlightPaused) {
+        return
+    }
+    ; If the overlay was torn down while paused (genuine stop path), the
+    ; pause state belongs to a DEAD panel — resuming would speak with no
+    ; visible box. Only resume a pause that still has a live overlay to
+    ; attach to; otherwise just clear the flag (next read starts fresh).
+    if (HighlightGui = "") {
+        HighlightPaused := false
         return
     }
     HighlightPaused := false
@@ -1130,28 +1168,47 @@ OverlayDragHandler(wParam, lParam, msg, hwnd) {
     if (HighlightGui = "" or hwnd != HighlightGui.Hwnd) {
         return
     }
+    ; Suppress the micro-drag glitch: a press on the panel edge that
+    ; drifts 0-2px and releases should NOT reposition the panel
+    ; (rounded-corner dead pixels + hand jitter made single clicks nudge
+    ; the box). DragTrackOverlay applies a 4px dead zone before the
+    ; first Move; the offset is captured here.
     CoordMode "Mouse", "Screen"
     MouseGetPos &mx, &my
     WinGetPos &wx, &wy,,, "ahk_id " . HighlightGui.Hwnd
     gDragOffX := mx - wx
     gDragOffY := my - wy
+    gDragStartX := mx
+    gDragStartY := my
+    gDragMoved := false
     ; Track until release without stealing focus: poll in a tight loop is
     ; bad (blocks the tick); instead install a temporary timer.
     SetTimer DragTrackOverlay, 16
 }
 
 DragTrackOverlay() {
-    global HighlightGui, gDragOffX, gDragOffY
+    global HighlightGui, gDragOffX, gDragOffY, gDragMoved, gDragStartX, gDragStartY
     if (HighlightGui = "") {
         SetTimer DragTrackOverlay, 0
+        gDragMoved := false
         return
     }
     if !GetKeyState("LButton", "P") {
         SetTimer DragTrackOverlay, 0
+        gDragMoved := false
         return
     }
     CoordMode "Mouse", "Screen"
     MouseGetPos &mx, &my
+    ; 4px dead zone before the first Move: a press that hasn't actually
+    ; travelled is a click, not a drag — hand jitter on the panel edge
+    ; was nudging the box on single clicks (the micro-position glitch).
+    if (!gDragMoved) {
+        if (Abs(mx - gDragStartX) < 4 and Abs(my - gDragStartY) < 4) {
+            return
+        }
+        gDragMoved := true
+    }
     HighlightGui.Move(mx - gDragOffX, my - gDragOffY)
 }
 
@@ -1258,6 +1315,23 @@ HideHighlightOverlay() {
 ; Opens via Ctrl+Alt+T or the tray menu. Stays open until closed so the user
 ; can review what was read. If the highlight overlay is active, the transcript
 ; syncs to show the same text.
+
+; Reduced-motion detection (design contract #18): read the system
+; "animate controls" preference once per overlay build. When disabled,
+; every fade/animation becomes an instant snap — respect the user's OS
+; setting instead of forcing motion on them.
+ReducedMotionEnabled() {
+    ; SPI_GETCLIENTAREAANIMATION = 0x1042. pvParam receives a BOOL.
+    val := 0
+    try {
+        buf := Buffer(4, 0)
+        if DllCall("SystemParametersInfo", "uint", 0x1042, "uint", 0, "ptr", buf, "uint", 0) {
+            val := NumGet(buf, 0, "uint")
+        }
+    }
+    ; Returns TRUE (1) when client-area animation is ENABLED.
+    return (val != 0)
+}
 
 ShowTranscript(*) {
     global TranscriptGui, HighlightFullText
@@ -1438,19 +1512,35 @@ ParseWordTimings(json) {
 FindWordIndex(words, elapsedMs) {
     ; words is 1-based AHK array of [word, startMs, endMs, charStart, charEnd].
     ; Return 0-based index of the word whose [startMs, endMs) contains elapsedMs.
-    if (words.Length = 0) {
+    ; BINARY SEARCH: the old linear scan was O(N) per 30ms tick; with
+    ; full-context seek packets (whole-document word lists) that became
+    ; a per-tick sweep of hundreds of words — wasted work in the very
+    ; tick that must stay lean (WM_PAINT starvation root cause).
+    n := words.Length
+    if (n = 0) {
         return -1
     }
-    i := 1
-    while (i <= words.Length) {
-        w := words[i]
-        if (elapsedMs >= w[2] and elapsedMs < w[3]) {
-            return i - 1
-        }
-        i++
+    ; Zero-timed seek prefix (daemon pads already-spoken words with
+    ; [0,0]) — skip them so a resume highlights the CURRENT word, not
+    ; the first prefix word that matches elapsed < endMs.
+    lo := 1
+    while (lo <= n and words[lo][2] = 0 and words[lo][3] = 0) {
+        lo++
     }
-    ; If past the last word, return last index.
-    return words.Length - 1
+    if (lo > n) {
+        return n - 1
+    }
+    ; Binary search for the last word with startMs <= elapsedMs.
+    hi := n
+    while (lo < hi) {
+        mid := (lo + hi + 1) // 2
+        if (words[mid][2] <= elapsedMs) {
+            lo := mid
+        } else {
+            hi := mid - 1
+        }
+    }
+    return lo - 1
 }
 
 SetTranslucent(hwnd, opacity) {
