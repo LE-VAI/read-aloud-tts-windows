@@ -481,7 +481,11 @@ SpeakViaDaemon(text) {
     ; Escape the text for JSON.
     jsonText := JsonEscape(text)
     req := '{"action":"speak","text":"' . jsonText . '"}'
-    ; Clean up any stale response and highlight files.
+    ; Clean up any stale response/highlight/request files. Deleting the
+    ; request file matters: if the daemon is mid-read of an old request,
+    ; FileAppend would CONCATENATE onto it and the daemon would reject the
+    ; merged JSON (silent no-read).
+    try FileDelete RequestPath
     try FileDelete ResponsePath
     try FileDelete HighlightPath
     FileAppend req, RequestPath, "UTF-8-RAW"
@@ -801,7 +805,16 @@ HighlightTick() {
     } else if (state = "playing") {
         HighlightOnPlaying(raw)
     } else if (state = "done" or state = "stop") {
-        HighlightOnStop()
+        ; While hover-paused, the daemon's stop state is EXPECTED (pause
+        ; stops playback) and may be followed by a done state from the
+        ; playback worker exiting. Neither may tear the overlay down or
+        ; kill this timer — that was the "hovering makes the box
+        ; disappear" bug, and the dead timer then stranded
+        ; HighlightPaused=true into the NEXT read, whose hover machine
+        ; resumed from a stale word index (mid-paragraph restarts).
+        if (!HighlightPaused) {
+            HighlightOnStop()
+        }
     }
 }
 
@@ -953,12 +966,18 @@ ToggleOverlayEnabled() {
 ShowHighlightOverlay(text) {
     global HighlightGui, HighlightFullText, gLastSelStart, gLastSelEnd, gOverlayDpi
     global gHoverInside, gHoverLeftAt, gHoverPauseRequested, gHoverResumeRequested
+    global HighlightPaused, HighlightCurrentIdx
     HideReplayBar()   ; a new read supersedes the finished-read replay bar
     HideHighlightOverlay()
     HighlightFullText := text
     ; Reset selection/hover state so a rebuilt overlay starts clean (a
     ; stale gLastSel* would suppress the first highlight; stale hover
-    ; requests would instantly pause a fresh read).
+    ; requests would instantly pause a fresh read). Crucially, clear the
+    ; PAUSE state and word index too: a hover-pause left them set from the
+    ; PREVIOUS read, and the first hover-resume then seeked into the new
+    ; text mid-paragraph (stale HighlightCurrentIdx against fresh words).
+    HighlightPaused := false
+    HighlightCurrentIdx := -1
     gLastSelStart := -1
     gLastSelEnd := -1
     gHoverInside := false
@@ -1033,15 +1052,17 @@ OverlayHoverPause(*) {
 }
 
 OverlayMouseLeaveResume(*) {
-    global HighlightPaused, HighlightCurrentIdx
+    global HighlightPaused, HighlightCurrentIdx, HighlightFullText
     if (!HighlightPaused) {
         return
     }
-    ; NOTE: no HighlightGui check here — hover-pause may have torn the
-    ; overlay down (stop-state handler); resume must fire regardless.
     HighlightPaused := false
-    ; Resume from the current word index.
-    if (HighlightCurrentIdx >= 0) {
+    ; Guard against a stale index: HighlightCurrentIdx was reset to -1 on
+    ; the previous read's teardown, and ShowHighlightOverlay resets it for
+    ; every new read. Only resume when we actually have a word position
+    ; AND text to resume from — otherwise the seek would slice a fresh
+    ; paragraph mid-sentence (the "starts mid paragraph" bug).
+    if (HighlightCurrentIdx >= 0 and HighlightFullText != "") {
         SeekFromWord(HighlightCurrentIdx)
     }
 }
@@ -1130,7 +1151,9 @@ SeekFromWord(idx) {
     HighlightCurrentIdx := idx
     ; Stop current playback.
     StopSpeechDaemon()
-    ; Clear state and send a seek request.
+    ; Clear state and send a seek request (delete the request file first —
+    ; same FileAppend-concatenation hazard as SpeakViaDaemon).
+    try FileDelete RequestPath
     try FileDelete ResponsePath
     try FileDelete HighlightPath
     jsonText := JsonEscape(HighlightFullText)
