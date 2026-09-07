@@ -30,6 +30,7 @@ global HighlightCurrentIdx := -1
 global HighlightPaused := false
 global HighlightFullText := ""
 global TranscriptGui := ""
+global ReplayGui := ""
 ; Last cursor position — used by HighlightTick to require mouse MOVEMENT
 ; before hover-pause (prevents pause/resume flapping when the overlay
 ; rebuilds under a resting cursor).
@@ -236,6 +237,7 @@ InitTray() {
     }
     A_TrayMenu.Add("Voice", voiceMenu)
     A_TrayMenu.Add()
+    A_TrayMenu.Add("Open Reading Overlay", (*) => OpenReadingOverlay())
     A_TrayMenu.Add("Open Config", (*) => OpenConfig())
     A_TrayMenu.Add("Open Logs", (*) => OpenLogs())
     A_TrayMenu.Add("Show Transcript`tCtrl+Alt+T", (*) => ShowTranscript())
@@ -513,6 +515,23 @@ JsonEscape(text) {
     text := StrReplace(text, "`n", "\n")
     text := StrReplace(text, "`r", "\r")
     text := StrReplace(text, "`t", "\t")
+    ; Control characters (0x00-0x1F, 0x7F) not covered above — vertical tab,
+    ; form feed, and stray 0x01s ride along in PDF/web clipboard copies —
+    ; are invalid JSON and make the daemon's json.loads reject the whole
+    ; request ("Unknown action: error", silent no-audio). Replace each with
+    ; a space so the read plays instead of failing. (The daemon's own
+    ; sanitize_text would strip them anyway, but it only sees the text
+    ; AFTER JSON parsing — this is the parse gate.)
+    loop StrLen(text) {
+        ch := SubStr(text, A_Index, 1)
+        code := Ord(ch)
+        if (code < 32 or code = 127) {
+            ; ch is either one of the four escaped above (now "\" + letter,
+            ; two chars, code > 31) or a raw control char needing replacement.
+            ; A raw control char: replace it in place.
+            text := SubStr(text, 1, A_Index - 1) . " " . SubStr(text, A_Index + 1)
+        }
+    }
     return text
 }
 
@@ -607,6 +626,7 @@ StopSpeech(*) {
     global PidPath, RequestPath, ResponsePath
     ; Stop the highlight overlay first.
     StopHighlightTimer()
+    HideReplayBar()   ; a manual stop dismisses the replay offer
     HideHighlightOverlay()
     ; If the daemon is running, send it a stop request.
     if IsDaemonReady() {
@@ -627,6 +647,22 @@ StopSpeech(*) {
 OpenConfig(*) {
     global ConfigPath, Q
     Run "notepad.exe " . Q . ConfigPath . Q
+}
+
+OpenReadingOverlay(*) {
+    ; The daemon's loopback karaoke viewer. Port comes from config.json
+    ; (overlay_port, default 8792) so a custom port doesn't strand the
+    ; menu item. If the daemon isn't up yet, StartDaemon brings it.
+    global ConfigPath, AppDir
+    port := 8792
+    try {
+        content := FileRead(ConfigPath, "UTF-8-RAW")
+        if RegExMatch(content, '"overlay_port"\s*:\s*(\d+)', &m) {
+            port := Integer(m[1])
+        }
+    }
+    StartDaemon()
+    Run "http://127.0.0.1:" . port . "/overlay"
 }
 
 OpenLogs(*) {
@@ -766,8 +802,55 @@ HighlightOnPlaying(raw) {
 }
 
 HighlightOnStop() {
+    global HighlightPaused, HighlightCurrentIdx, HighlightFullText
     StopHighlightTimer()
+    ; Finished reads leave a small Replay bar instead of nothing: the last
+    ; text stays one click away (replay-from-finished), no re-select needed.
+    ; The bar is destroyed by the next ShowHighlightOverlay or ExitFunc.
+    if (!HighlightPaused and HighlightFullText != "") {
+        ShowReplayBar()
+    }
     HideHighlightOverlay()
+}
+
+; --- Replay-from-finished bar ---------------------------------------------
+; A tiny always-on-top strip (bottom-right): "↻ Replay". Click re-speaks
+; the last read from word 0; F6 or a read elsewhere hides it. No daemon
+; state is touched until clicked, so it can't interfere with a new read.
+
+ShowReplayBar() {
+    global ReplayGui
+    HideReplayBar()
+    ReplayGui := Gui("+AlwaysOnTop -Caption +ToolWindow +E0x08000000")
+    ReplayGui.BackColor := "1a1a2e"
+    ReplayGui.SetFont("s11 cF2C14E", "Segoe UI")
+    btn := ReplayGui.Add("Text", "w90 h30 Center Background1a1a2e", "↻ Replay")
+    btn.OnEvent("Click", (*) => ReplayLastText())
+    ReplayGui.Show("x0 y0 Hide NA")
+    ; Position bottom-right after sizing.
+    barW := 106, barH := 38
+    ReplayGui.Move(A_ScreenWidth - barW - 24, A_ScreenHeight - barH - 24, barW, barH)
+    ReplayGui.Show("NA")
+    SetTranslucent(ReplayGui.Hwnd, 230)
+}
+
+HideReplayBar() {
+    global ReplayGui
+    if ReplayGui != "" {
+        try ReplayGui.Destroy()
+        ReplayGui := ""
+    }
+}
+
+ReplayLastText() {
+    global HighlightFullText, HighlightPaused, HighlightCurrentIdx
+    if (HighlightFullText = "") {
+        return
+    }
+    HideReplayBar()
+    HighlightPaused := false
+    HighlightCurrentIdx := 0
+    SeekFromWord(0)
 }
 
 ; --- Overlay GUI ---
@@ -801,6 +884,7 @@ ToggleOverlayEnabled() {
 
 ShowHighlightOverlay(text) {
     global HighlightGui, HighlightFullText
+    HideReplayBar()   ; a new read supersedes the finished-read replay bar
     HideHighlightOverlay()
     HighlightFullText := text
     ; +E0x08000000 = WS_EX_NOACTIVATE: window doesn't steal focus when clicked.
@@ -1050,10 +1134,74 @@ JsonGet(json, key) {
     if RegExMatch(json, pat . '(-?\d+\.?\d*)', &m) {
         return m[1]
     }
-    if RegExMatch(json, pat . '"([^"]*)"', &m) {
-        return m[1]
+    ; String values: capture up to the CLOSING quote, skipping escaped
+    ; quotes (\"), then decode the standard JSON escapes. The old
+    ; '"([^"]*)"' pattern stopped at the first quote — text like
+    ; 'He said "wait"' captured as 'He said \' and a later click-to-rewind
+    ; re-spoke the truncated capture (proven round-trip 2026-09-06).
+    if RegExMatch(json, pat . '"((?:[^"\\]|\\.)*)"', &m) {
+        return JsonUnescape(m[1])
     }
     return ""
+}
+
+JsonUnescape(s) {
+    ; Decode the JSON escapes the daemon emits (json.dumps output):
+    ; \" \\ \/ \n \r \t \b \f and \uXXXX. Order matters — resolve
+    ; backslash-pairs LAST so "\\" (an escaped backslash) is not mistaken
+    ; for an escape prefix. Single scan, no double-unescaping.
+    if !InStr(s, "\") {
+        return s
+    }
+    out := ""
+    i := 1
+    len := StrLen(s)
+    while (i <= len) {
+        ch := SubStr(s, i, 1)
+        if (ch != "\") {
+            out .= ch
+            i++
+            continue
+        }
+        next := SubStr(s, i + 1, 1)
+        switch next {
+            case '"':  out .= '"',    i += 2
+            case "\":  out .= "\",    i += 2
+            case "/":  out .= "/",    i += 2
+            case "n":  out .= "`n",   i += 2
+            case "r":  out .= "`r",   i += 2
+            case "t":  out .= "`t",   i += 2
+            case "b":  out .= " ",    i += 2
+            case "f":  out .= " ",    i += 2
+            ; NOTE: no OTB brace after the case label — "case x: {" on one
+            ; line is a v2 syntax error ("Unexpected {"); the block brace
+            ; must open on its own line.
+            case "u":
+            {
+                hex := SubStr(s, i + 2, 4)
+                code := RegExMatch(hex, "^[0-9a-fA-F]{4}$") ? Integer("0x" . hex) : 0x20
+                ; Surrogate pair: high half U+D800-DBFF followed by \uDC00-DFFF.
+                ; The pair is 12 characters (\uXXXX\uXXXX) — consume all of
+                ; them or trailing hex digits leak into the text.
+                if (code >= 0xD800 and code <= 0xDBFF and SubStr(s, i + 6, 2) = "\u") {
+                    lowHex := SubStr(s, i + 8, 4)
+                    if RegExMatch(lowHex, "^[0-9a-fA-F]{4}$") {
+                        low := Integer("0x" . lowHex)
+                        if (low >= 0xDC00 and low <= 0xDFFF) {
+                            code := 0x10000 + ((code - 0xD800) << 10) + (low - 0xDC00)
+                            out .= Chr(code)
+                            i += 12
+                            continue
+                        }
+                    }
+                }
+                out .= Chr(code)
+                i += 6
+            }
+            default:  out .= next, i += 2  ; unknown escape: keep next char
+        }
+    }
+    return out
 }
 
 ParseWordTimings(json) {
@@ -1064,12 +1212,17 @@ ParseWordTimings(json) {
     result := []
     text := JsonGet(json, "text")
     pos := 1
-    ; Find each word tuple via regex.
-    pat := '\["([^"]+)",\s*([\d.]+),\s*([\d.]+)\]'
+    ; Find each word tuple via regex. The word is a JSON string literal and
+    ; may itself contain escaped quotes/tokens (e.g. ["\"wait\"",...]) —
+    ; capture the full literal, then JsonUnescape it. The old '"([^"]+)"'
+    ; pattern dropped such words entirely, which ALSO desynced AHK word
+    ; indexes from the daemon's \S+ token list (click-to-rewind landed on
+    ; the wrong word).
+    pat := '\["((?:[^"\\]|\\.)*)",\s*([\d.]+),\s*([\d.]+)\]'
     searchFrom := 1
     charSearchPos := 1
     while RegExMatch(json, pat, &m, searchFrom) {
-        word := m[1]
+        word := JsonUnescape(m[1])
         startMs := Round(m[2])
         endMs := Round(m[3])
         ; Find this word's char offset in the full text (sequential scan).
@@ -1119,6 +1272,7 @@ OnExit(ExitFunc)
 
 ExitFunc(*) {
     StopHighlightTimer()
+    HideReplayBar()
     HideHighlightOverlay()
     CloseTranscript()
     StopDaemon()
