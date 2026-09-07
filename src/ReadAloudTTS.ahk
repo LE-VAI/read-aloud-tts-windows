@@ -766,7 +766,7 @@ HighlightOnStart(raw) {
 
 HighlightOnPlaying(raw) {
     global HighlightWords, HighlightPlayStart, HighlightTotalMs, HighlightGui
-    global HighlightCurrentIdx, HighlightPaused
+    global HighlightCurrentIdx, HighlightPaused, AppDir
     ; Skip updates while paused (hover-pause).
     if (HighlightPaused) {
         return
@@ -777,6 +777,13 @@ HighlightOnPlaying(raw) {
         totalMs := JsonGet(raw, "total_ms")
         HighlightTotalMs := (totalMs != "") ? Round(totalMs) : 0
         HighlightWords := ParseWordTimings(raw)
+        ; Fallback: if this bare "playing" packet raced past the daemon's
+        ; "start" window (poller never saw text+words), recover the text
+        ; from the once-per-speak sidecar the daemon writes for the web
+        ; overlay. Without this the box appears EMPTY (no text at all).
+        if (text = "") {
+            try text := FileRead(AppDir . "tmp\overlay_text.json", "UTF-8")
+        }
         ShowHighlightOverlay(text)
     }
     msStr := JsonGet(raw, "ms")

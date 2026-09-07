@@ -580,9 +580,23 @@ def handle_speak(text: str, from_word: int = 0) -> dict[str, str]:
                 # otherwise let the audio finish naturally — the trailing
                 # silence ensures the poll ending early only clips silence.
                 poll_end = time.time() + chunk_duration_s + 0.8
+                # Hold the "start" packet on the wire for HOLD_START_S so a
+                # 30ms AHK/overlay poller cannot miss it (the first bare
+                # "playing" write used to land within ~10ms and overwrite
+                # text+words before any poller read — empty-box bug).
+                # The audio device is still opening (~500ms WASAPI latency),
+                # so nothing audible is masked.
+                hold_start_until = t_chunk_start + 0.4 if ci == 0 else 0.0
                 while not _stop_requested and time.time() < poll_end:
                     elapsed_ms = chunk_offset_ms + (time.time() - t_chunk_start) * 1000.0
-                    if len(all_word_timings) != written_words_count:
+                    if time.time() < hold_start_until:
+                        _write_highlight_state({
+                            "state": "start",
+                            "text": text,
+                            "words": all_word_timings,
+                            "total_ms": round(chunk_offset_ms + chunk_duration_s * 1000.0),
+                        })
+                    elif len(all_word_timings) != written_words_count:
                         # New chunk synthesized while playing — send the grown
                         # timings so the overlay can highlight ahead of audio.
                         written_words_count = len(all_word_timings)
