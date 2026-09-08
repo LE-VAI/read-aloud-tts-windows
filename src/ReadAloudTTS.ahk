@@ -1541,10 +1541,19 @@ OverlayDragHandler(wParam, lParam, msg, hwnd) {
     ; (not the Edit) starts a Windows-standard drag. The Edit consumes
     ; its own clicks (click-to-rewind); the panel margins are the grab
     ; zone. Uses the mouse-move stream already driven by the tick.
-    global HighlightGui, gDragOffX, gDragOffY
+    global HighlightGui, gDragOffX, gDragOffY, gDragStartX, gDragStartY, gDragMoved
     global gOverlayDpi, gOverlayScale, gDragScaling, gDragScaleStart
-    global gDragScaleStartX, gDragScaleStartY, gDragScaleMoved
-    if (HighlightGui = "" or hwnd != HighlightGui.Hwnd) {
+    global gDragScaleStartX, gDragScaleStartY, gDragScaleMoved, OverlayGripCtrl
+    ; The grip GLYPH is its own child window — a press on it arrives with
+    ; the glyph's hwnd, not the panel's. Accept both (the glyph sits
+    ; entirely inside the grip zone, so the zone math is identical); the
+    ; status line's far-right sliver that overlaps the zone stays a no-op
+    ; (pressing text-status pixels doing nothing is the safe default).
+    gripHwnd := 0
+    if (IsObject(OverlayGripCtrl)) {
+        try gripHwnd := OverlayGripCtrl.Hwnd
+    }
+    if (HighlightGui = "" or (hwnd != HighlightGui.Hwnd and hwnd != gripHwnd)) {
         return
     }
     ; Suppress the micro-drag glitch: a press on the panel edge that
@@ -1552,33 +1561,42 @@ OverlayDragHandler(wParam, lParam, msg, hwnd) {
     ; (rounded-corner dead pixels + hand jitter made single clicks nudge
     ; the box). DragTrackOverlay applies a 4px dead zone before the
     ; first Move; the offset is captured here.
-    CoordMode "Mouse", "Screen"
-    MouseGetPos &mx, &my
+    ;
+    ; Press point from lParam (client coords of the receiving hwnd), NOT
+    ; MouseGetPos: the physical cursor can move between the click and this
+    ; handler running, and lParam IS the click. For a press on the grip
+    ; GLYPH (its own child hwnd), translate glyph-client -> panel-client
+    ; via the two origins.
+    WinGetPos &wx, &wy, &ww, &wh, "ahk_id " . HighlightGui.Hwnd
+    px := lParam & 0xFFFF
+    py := (lParam >> 16) & 0xFFFF
+    if (gripHwnd != 0 and hwnd = gripHwnd) {
+        WinGetPos &ggx, &ggy,,, "ahk_id " . gripHwnd
+        px += ggx - wx
+        py += ggy - wy
+    }
     ; GRIP ZONE branch: a press in the bottom-right corner (the ◢ glyph
     ; is the visual hint) starts a SCALE drag, not a move drag. Zone =
-    ; 24x24 at panel scale (px scaled with uiScale so it stays grabbable
-    ; when zoomed) measured from the panel's bottom-right corner, using
-    ; screen coords (press position minus panel origin). The same 4px
-    ; dead zone + release-persist model as the move drag.
-    WinGetPos &wx, &wy, &ww, &wh, "ahk_id " . HighlightGui.Hwnd
+    ; 24x24 at panel scale measured from the panel's bottom-right corner
+    ; in panel-client coords. The same 4px dead zone + release-persist
+    ; model as the move drag.
     dpiScale2 := gOverlayDpi / 96.0
     uiScale2 := dpiScale2 * gOverlayScale
     gz := Round(24 * uiScale2)
-    if (mx >= wx + ww - gz and mx <= wx + ww and my >= wy + wh - gz and my <= wy + wh) {
+    if (px >= ww - gz and px <= ww and py >= wh - gz and py <= wh) {
         gDragScaling := true
         gDragScaleStart := gOverlayScale
-        gDragScaleStartX := mx
-        gDragScaleStartY := my
+        gDragScaleStartX := wx + px
+        gDragScaleStartY := wy + py
         gDragScaleMoved := false
-        DebugLog "ScaleDrag armed at " . mx . "," . my
+        DebugLog "ScaleDrag armed at " . px . "," . py . " (panel-client)"
         SetTimer DragScaleTrackOverlay, 16
         return 1   ; consume: not a move-drag press
     }
-    WinGetPos &wx, &wy,,, "ahk_id " . HighlightGui.Hwnd
-    gDragOffX := mx - wx
-    gDragOffY := my - wy
-    gDragStartX := mx
-    gDragStartY := my
+    gDragOffX := px
+    gDragOffY := py
+    gDragStartX := wx + px
+    gDragStartY := wy + py
     gDragMoved := false
     ; Track until release without stealing focus: poll in a tight loop is
     ; bad (blocks the tick); instead install a temporary timer.
