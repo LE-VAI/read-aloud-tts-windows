@@ -1676,12 +1676,60 @@ SelectOverlayWord(idx) {
             ColorWordRange(reHwnd, prev[4], prev[5], gCfBase)
         }
     }
-    ; Color the current word amber + scroll it into view (EM_SCROLLCARET
-    ; 0xB7 — NOT 0x448, which is EM_SETTARGETDEVICE and would change
-    ; word-wrap layout).
+    ; Color the current word amber + page it into view. EM_SCROLLCARET
+    ; (0xB7) is a NO-OP on this control: the panel's RichEdit is readonly
+    ; AND windowless-scrollbar-style (no WS_VSCROLL), and probe5 proved
+    ; every classic scroll route refuses it (SCROLLCARET ret=0, LINESCROLL
+    ; and WM_VSCROLL leave FIRSTVISIBLE pinned at 0) — the "dialogue frozen
+    ; after the first two sentences" bug: the amber word marched through
+    ; the whole read while the visible 2-line window never scrolled.
+    ; EM_SETSCROLLPOS (0x4DE — RichEdit-only, undocumented in MSDN) is the
+    ; one route that works READONLY (probe5: ret=1, FV tracks, clamps).
+    ; PAGE-FLIP semantics, not pixel-follow: compute the amber word's
+    ; display line via EM_LINEFROMCHAR, page when it leaves the viewport
+    ; so its line becomes the TOP visible line. Page-flip at reading
+    ; pace avoids any jitter/oscillation from continuous micro-scrolls.
     ColorWordRange(reHwnd, charStart, charEnd, gCfAmber)
-    SendMessage(0x00B7, 0, 0, reHwnd)
+    ScrollWordIntoView(reHwnd, charStart)
     HighlightLastColored := idx
+}
+
+ScrollWordIntoView(reHwnd, charIdx) {
+    ; Visible-band math from three EM_POSFROMCHAR probes (0x426):
+    ; line pitch 28px, client height 56px = exactly 2 display lines, and
+    ; the return packs x=LOWORD/y=HIWORD — a signed read (pos >> 16)
+    ; keeps negative y (word above the viewport) intact. y<0 → above the
+    ; band; y+pitch>clientH → below. Both page-flip so the word's line
+    ; becomes the TOP visible line; a mid-line word stays put (already
+    ; visible). EM_SETSCROLLPOS takes a POINT in CLIENT coordinates:
+    ; probe5 showed y=56 → FIRSTVISIBLE=2 and y=100000 clamps to the
+    ; doc max, so it accepts any target and clamps — no manual clamp.
+    pos := SendMessage(0x0426, charIdx, 0, reHwnd)
+    y := pos >> 16
+    ; Line pitch measured live (view-relative y is scroll-invariant):
+    ; doc line 1 minus doc line 0. Single-line docs keep the probe default.
+    pitch := 28
+    if (SendMessage(0x00BA, 0, 0, reHwnd) > 1) {
+        c0 := SendMessage(0x00BB, 0, 0, reHwnd)
+        c1 := SendMessage(0x00BB, 1, 0, reHwnd)
+        pitch := (SendMessage(0x0426, c1, 0, reHwnd) >> 16) - (SendMessage(0x0426, c0, 0, reHwnd) >> 16)
+        if (pitch <= 0) {
+            pitch := 28
+        }
+    }
+    rc := Buffer(16, 0)
+    DllCall("GetClientRect", "ptr", reHwnd, "ptr", rc)
+    clientH := NumGet(rc, 12, "Int")
+    if (y < 0 or y + pitch > clientH) {
+        line := SendMessage(0x00C9, charIdx, 0, reHwnd)  ; EM_LINEFROMCHAR
+        pt := Buffer(8, 0)
+        NumPut("Int", 0, pt, 0)
+        NumPut("Int", line * pitch, pt, 4)
+        SendMessage(0x04DE, 0, pt.Ptr, reHwnd)
+    }
+    ; Words already inside the band: no scroll — mid-line words never
+    ; micro-move. The 0.4s hold packet at read start also doesn't scroll:
+    ; char 0 is always visible.
 }
 
 HideHighlightOverlay() {
