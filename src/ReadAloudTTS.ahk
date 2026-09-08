@@ -38,6 +38,7 @@ global HighlightPaused := false
 global HighlightFullText := ""
 global gSeekInFlight := false
 global gLastSeekTick := 0
+global gOnStartLogged := false
 global gOverlayReducedMotion := false
 global TranscriptGui := ""
 global ReplayGui := ""
@@ -773,7 +774,7 @@ StopHighlightTimer() {
 }
 
 HighlightTick() {
-    global HighlightGui, HighlightPaused, gSeekInFlight, gLastTickState
+    global HighlightGui, HighlightPaused, gSeekInFlight, gLastTickState, gOnStartLogged
     ; Critical 50: serialize this tick against hotkeys/OnMessage for up to
     ; 50ms — the 30ms timer and the WM_LBUTTONDOWN handler both mutate
     ; shared state and AHK preempts a timer thread by default (mid-tick
@@ -806,6 +807,12 @@ HighlightTick() {
     if (state != gLastTickState) {
         DebugLog "Tick state=" . state . " len=" . StrLen(raw)
         gLastTickState := state
+        ; Leaving a "start" hold window re-arms the OnStart detail log
+        ; (the daemon holds the start packet 0.4s = ~13 ticks; without
+        ; this reset gate each seek flooded 13 identical detail lines).
+        if (state != "start") {
+            gOnStartLogged := false
+        }
     }
     if (state = "start") {
         HighlightOnStart(raw)
@@ -841,7 +848,7 @@ IsMouseOverOverlay() {
 HighlightOnStart(raw) {
     global HighlightWords, HighlightTotalMs, HighlightPlayStart
     global HighlightGui, HighlightCurrentIdx, HighlightFullText
-    global gSeekInFlight, gOverlayDismissed
+    global gSeekInFlight, gOverlayDismissed, gOnStartLogged
     ; The new speak's start packet arrived — terminal-state suppression
     ; (gSeekInFlight) is no longer needed; from here the daemon's states
     ; are genuine again.
@@ -855,9 +862,15 @@ HighlightOnStart(raw) {
     ; Parse words: [["word",start_ms,end_ms],...]
     HighlightWords := ParseWordTimings(raw)
     HighlightPlayStart := A_TickCount
-    DebugLog "OnStart: gui=" . (HighlightGui != "" ? "exists" : "new")
-        . " words=" . HighlightWords.Length . " textLen=" . StrLen(text)
-        . " sameText=" . (text = HighlightFullText)
+    ; Once per start episode: the daemon holds the "start" packet 0.4s
+    ; (~13 ticks) and every seek re-holds it — an unconditional log here
+    ; wrote 13 identical lines per seek during live use 2026-09-08.
+    if (!gOnStartLogged) {
+        gOnStartLogged := true
+        DebugLog "OnStart: gui=" . (HighlightGui != "" ? "exists" : "new")
+            . " words=" . HighlightWords.Length . " textLen=" . StrLen(text)
+            . " sameText=" . (text = HighlightFullText)
+    }
     if (HighlightGui != "" and text = HighlightFullText) {
         ; SEEK-RESUME, not a new read: the daemon now sends the FULL text
         ; with zero-timed prefix words on seeks (hover-resume /
