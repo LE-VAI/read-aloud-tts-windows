@@ -37,6 +37,7 @@ global HighlightLastColored := -1
 global HighlightPaused := false
 global HighlightFullText := ""
 global gSeekInFlight := false
+global gLastSeekTick := 0
 global gOverlayReducedMotion := false
 global TranscriptGui := ""
 global ReplayGui := ""
@@ -126,10 +127,21 @@ $*^/::AdjustSpeed(1.1)
 ; Click-to-rewind on the highlight overlay: register the WM_LBUTTONDOWN
 ; monitor ONCE here. Previously it was registered inside every
 ; ShowHighlightOverlay() build, stacking duplicate message handlers.
-OnMessage(0x201, OverlayClickHandler)
-; Drag: left button on the panel margins (the Edit consumes its own clicks)
-; starts a manual drag. Registered once, same reasoning.
 OnMessage(0x201, OverlayDragHandler)
+; Click-to-rewind on the RichEdit surface. EM_CHARFROMPOS on RichEdit
+; is 0x427 (WM_USER+39) — NOT the classic Edit's 0xD7 — and takes a
+; pointer to a POINT struct, returning the flat char index (not the
+; packed low-word of the classic Edit).
+OnMessage(0x201, OverlayClickHandler)
+; Double-click suppression: a rapid second click on the same word (the
+; user investigating the vanish) made the RichEdit child run its
+; native double-click WORD-SELECT, and with the child focused the old
+; selection block became visible — the "blue select mode" report. Block
+; the message at the window level: the RichEdit never sees it, so it
+; never starts a native selection, and clicks keep flowing to the seek
+; handler below. (Losing native dblclick behavior is nothing — this
+; surface's only click verb is seek.)
+OnMessage(0x203, OverlayDoubleClickSuppress)
 
 StartDaemon()
 
@@ -1334,6 +1346,42 @@ OverlayClickHandler(wParam, lParam, msg, hwnd) {
     if (idx >= 0) {
         SeekFromWord(idx)
     }
+    ; SWALLOW the click: returning an integer keeps WM_LBUTTONDOWN away
+    ; from the RichEdit's own window proc. Its native handler is what
+    ; planted an insertion-point selection and could SetFocus the child —
+    ; and a focused RichEdit paints its selection block, the "blue select
+    ; mode" seen while click-storming the vanishing panel (live
+    ; 2026-09-07). The seek above is the click's only effect on this
+    ; display-only surface. Early returns above stay blank so clicks on
+    ; every other control process normally; panel-margin drag is bound to
+    ; the PANEL hwnd, unaffected by this.
+    return 1
+}
+
+; Second click of a system double-click on the RichEdit arrives as
+; WM_LBUTTONDBLCLK (0x203) INSTEAD of a second WM_LBUTTONDOWN — the
+; seek handler above never sees it. Swallow it too: the RichEdit's
+; native double-click WORD-SELECT was the other half of the blue-select
+; report, and a same-spot re-click inside the 200ms seek debounce
+; carries no new intent anyway (SeekFromWord already drops repeats).
+OverlayDoubleClickSuppress(wParam, lParam, msg, hwnd) {
+    global HighlightGui
+    if (HighlightGui = "") {
+        return
+    }
+    ctrlHwnd := 0
+    try {
+        ctrl := HighlightGui["RichEdit50W1"]
+        if IsObject(ctrl) {
+            ctrlHwnd := ctrl.Hwnd
+        }
+    } catch {
+        return
+    }
+    if (ctrlHwnd = 0 or hwnd != ctrlHwnd) {
+        return
+    }
+    return 1   ; swallow — no native word-select on this surface
 }
 
 OverlayDragHandler(wParam, lParam, msg, hwnd) {
@@ -1418,35 +1466,84 @@ FindWordByChar(words, charIdx) {
 
 SeekFromWord(idx) {
     global HighlightFullText, RequestPath, ResponsePath, HighlightPath
-    global HighlightCurrentIdx, gSeekInFlight
+    global HighlightCurrentIdx, gSeekInFlight, gLastSeekTick
+    global HighlightPaused
+    ; Click-storm debounce, BEFORE anything else: investigating the
+    ; vanish, the user click-stormed — the old code ran one FULL
+    ; seek request per click, each re-slicing the remainder and racing
+    ; the next. A repeat inside 200ms of the last accepted click is a
+    ; storm artifact, not new intent; drop it before touching state.
+    now := A_TickCount
+    if (now - gLastSeekTick < 200) {
+        return
+    }
+    gLastSeekTick := now
+    ; ARM FIRST, act second. The old body armed gSeekInFlight only AFTER
+    ; the daemon stop request and the file writes — but the daemon answers
+    ; a stop in single-digit ms while the 30ms tick was free to read that
+    ; {"state":"stop"} (plus the old playback worker's late "done") with
+    ; the flag still false → HighlightOnStop tore the panel down mid-
+    ; click. That ordering race WAS the "dialogue disappears when I
+    ; click a word" bug (live 2026-09-07). Nothing below may yield the
+    ; thread before this line: a preempting tick must see the flag set.
+    gSeekInFlight := true
+    ; Backstop for every "start never comes" path — dead daemon, lost
+    ; request, synth error before chunk 0 — so terminal-state suppression
+    ; cannot stay armed forever. A NAMED one-shot (SetTimer replaces the
+    ; pending one, same load-bearing reason as ReplayBarFade); a healthy
+    ; seek clears the flag long before this fires and the watchdog no-ops.
+    SetTimer SeekWatchdog, -6000
     HighlightCurrentIdx := idx
-    ; Stop current playback.
-    StopSpeechDaemon()
-    ; Clear state and send a seek request (delete the request file first —
-    ; same FileAppend-concatenation hazard as SpeakViaDaemon).
+    ; Click while paused = resume from the clicked word. Leaving the
+    ; pause flag set made the tick ignore the seek's packets: amber word
+    ; frozen, status line still saying "paused" while audio played.
+    if (HighlightPaused) {
+        HighlightPaused := false
+        SetOverlayStatus(false)
+    }
+    ; NO stop request. The daemon's run_speak_async takeover already
+    ; signals + cancels + joins the old playback worker the moment our
+    ; speak request arrives; a separate stop only injected {"state":"stop"}
+    ; mid-seek (the vanish trigger) and its WaitResponse(3) could block
+    ; the click handler for up to 3 seconds. The daemon's generation
+    ; counter (this same pass) keeps the superseded worker from writing a
+    ; late {"state":"done"} on top of the new read.
     try FileDelete RequestPath
     try FileDelete ResponsePath
     try FileDelete HighlightPath
     jsonText := JsonEscape(HighlightFullText)
     req := '{"action":"speak","text":"' . jsonText . '","from_word":' . idx . '}'
     FileAppend req, RequestPath, "UTF-8-RAW"
-    ; The daemon writes {"state":"stop"} (seek's StopSpeechDaemon) and a
-    ; late {"state":"done"} (the old playback worker exiting) — both
-    ; BEFORE the new speak's "start" packet. An un-gated tick would run
-    ; HighlightOnStop on them: the box flashes away, the timer dies, and
-    ; the in-place seek-resume never engages. Suppress terminal states
-    ; until the new "start" packet lands (HighlightOnStart clears it).
-    gSeekInFlight := true
+    ; Terminal states stay suppressed until the new "start" packet lands
+    ; (HighlightOnStart clears the flag). "playing" states during the
+    ; takeover window are harmless: the panel keeps its position and the
+    ; amber word jumps to the clicked word when "start" arrives.
     ; Restart the highlight timer (only when the overlay is enabled).
     if ShowOverlayEnabled() {
         StartHighlightTimer()
     }
 }
 
+; Safety net for every path where a seek's "start" packet never arrives
+; (daemon died, request lost, synth failed before chunk 0): 6s after
+; arming, if the flag is STILL set, release terminal-state suppression so
+; a later genuine done/stop tears the panel down normally instead of
+; the panel living forever in seek mode. A healthy seek clears the flag
+; within ~2s (synth of chunk 0) and this no-ops.
+SeekWatchdog() {
+    global gSeekInFlight
+    if (gSeekInFlight) {
+        DebugLog "SeekWatchdog: start packet never arrived — releasing seek suppression"
+        gSeekInFlight := false
+    }
+    SetTimer SeekWatchdog, 0
+}
+
 StopSpeechDaemon() {
     global RequestPath, ResponsePath
     if IsDaemonReady() {
         try FileDelete ResponsePath
+        try FileDelete RequestPath
         FileAppend '{"action":"stop"}', RequestPath, "UTF-8-RAW"
         WaitResponse(3)
     }
@@ -1485,7 +1582,15 @@ ColorWordRange(reHwnd, charStart, charEnd, cf) {
     SendMessage(0x0437, 0, cr.Ptr, reHwnd)
     ; EM_SETCHARFORMAT (0x444) SCF_SELECTION (1). Returns nonzero on
     ; success — 0 means the format silently failed (validate!).
-    return SendMessage(0x0444, 1, cf.Ptr, reHwnd)
+    ok := SendMessage(0x0444, 1, cf.Ptr, reHwnd)
+    ; Collapse the selection the formatting just used: it otherwise sits
+    ; on the word for the whole read, and ANY focus event on the child
+    ; would paint it as a blue block (the residue under the blue-select
+    ; bug). The caret stays at the range end, so EM_SCROLLCARET still
+    ; tracks the same point it always did.
+    NumPut("Int", charEnd, cr, 0)
+    SendMessage(0x0437, 0, cr.Ptr, reHwnd)
+    return ok
 }
 
 SelectOverlayWord(idx) {

@@ -97,6 +97,16 @@ _VOICE_CACHE_MAX = 8
 _current_voice_id: str | None = None
 _playback_lock = threading.Lock()
 _stop_requested = False
+# Playback generation counter. Every speak request increments it and the
+# worker captures the value at entry; superseded workers are then barred
+# from BOTH hazards: (a) writing highlight state on top of the new read's
+# packets (a join(3) can time out mid-synth, so the old worker may still
+# be alive and writing "playing" for several seconds), and (b) re-setting
+# _stop_requested on exit — which used to poison the new worker's chunk
+# loop within 30ms of its start. The counter is read under the playback
+# lock or inside the main-loop thread; GIL-atomic int reads make this
+# safe without a dedicated lock.
+_speak_generation = 0
 # Runtime speed override (length_scale). When non-None, overrides the
 # config.json value so on-the-fly speed changes (Ctrl+=/Ctrl+-/Ctrl+0)
 # take effect on the next chunk without waiting for config reload.
@@ -317,6 +327,20 @@ def _write_highlight_state(state: dict[str, Any]) -> None:
         pass
 
 
+def _write_highlight_state_guarded(state: dict[str, Any], generation: int) -> None:
+    """Write highlight state only if this worker's generation is still current.
+
+    A superseded playback worker (its takeover join timed out mid-synth)
+    must not stomp the new read's packets: without the guard it kept
+    writing "playing" for seconds after the takeover, and its exit wrote
+    a late "done" that tore the overlay panel down mid-read — the
+    click-to-rewind vanish bug (2026-09-08).
+    """
+    if generation != _speak_generation:
+        return
+    _write_highlight_state(state)
+
+
 def _clear_highlight_state() -> None:
     """Remove the highlight state file."""
     try:
@@ -389,8 +413,23 @@ def handle_speak(text: str, from_word: int = 0) -> dict[str, str]:
     the overlay sends the original text + the word index to restart from).
     """
     global _stop_requested
+    global _speak_generation
     _stop_requested = False
     _clear_highlight_state()
+    # Claim this read's generation. Superseded workers (a takeover whose
+    # join timed out mid-synth) see a mismatch and write no further
+    # highlight state — see _write_highlight_state_guarded.
+    my_generation = _speak_generation
+
+    def superseded() -> bool:
+        """True once a newer speak request took over (it bumped the generation).
+
+        Checked at every chunk-loop checkpoint INSTEAD of _stop_requested
+        alone: the new worker clears that flag at ITS entry, so a join(3)
+        that times out mid-synth would otherwise leave the old worker
+        playing its full remainder over the new read (overlapping audio).
+        """
+        return my_generation != _speak_generation
 
     config = load_config()
     voice_id = config.get("current_voice", _current_voice_id)
@@ -506,7 +545,7 @@ def handle_speak(text: str, from_word: int = 0) -> dict[str, str]:
         playback_temp_dir = Path(tempfile.mkdtemp(prefix="playback-", dir=TMP_DIR))
         try:
             for ci, chunk in enumerate(chunks):
-                if _stop_requested:
+                if _stop_requested or superseded():
                     break
 
                 if ci == 0:
@@ -549,7 +588,7 @@ def handle_speak(text: str, from_word: int = 0) -> dict[str, str]:
                         wt[2] = round(wt[2] + chunk_offset_ms, 1)
                     all_word_timings.extend(wtimings)
 
-                if _stop_requested:
+                if _stop_requested or superseded():
                     break
 
                 # Start the background synth for the NEXT chunk while we play.
@@ -575,12 +614,12 @@ def handle_speak(text: str, from_word: int = 0) -> dict[str, str]:
                 t_chunk_start = time.time()
                 if ci == 0:
                     written_words_count = len(all_word_timings)
-                    _write_highlight_state({
+                    _write_highlight_state_guarded({
                         "state": "start",
                         "text": full_text,
                         "words": all_word_timings,
                         "total_ms": round(chunk_offset_ms + chunk_duration_s * 1000.0),
-                    })
+                    }, my_generation)
                     # Once-per-speak text sidecar: the tail of a long read
                     # writes bare {"state":"playing","ms":...} (text rides
                     # only while the word list grows), but a web overlay
@@ -615,34 +654,39 @@ def handle_speak(text: str, from_word: int = 0) -> dict[str, str]:
                 # The audio device is still opening (~500ms WASAPI latency),
                 # so nothing audible is masked.
                 hold_start_until = t_chunk_start + 0.4 if ci == 0 else 0.0
-                while not _stop_requested and time.time() < poll_end:
+                while not _stop_requested and not superseded() and time.time() < poll_end:
                     elapsed_ms = chunk_offset_ms + (time.time() - t_chunk_start) * 1000.0
                     if time.time() < hold_start_until:
-                        _write_highlight_state({
+                        _write_highlight_state_guarded({
                             "state": "start",
                             "text": full_text,
                             "words": all_word_timings,
                             "total_ms": round(chunk_offset_ms + chunk_duration_s * 1000.0),
-                        })
+                        }, my_generation)
                     elif len(all_word_timings) != written_words_count:
                         # New chunk synthesized while playing — send the grown
                         # timings so the overlay can highlight ahead of audio.
                         written_words_count = len(all_word_timings)
-                        _write_highlight_state({
+                        _write_highlight_state_guarded({
                             "state": "playing",
                             "ms": round(elapsed_ms, 1),
                             "text": full_text,
                             "words": all_word_timings,
-                        })
+                        }, my_generation)
                     else:
-                        _write_highlight_state({"state": "playing", "ms": round(elapsed_ms, 1)})
+                        _write_highlight_state_guarded({"state": "playing", "ms": round(elapsed_ms, 1)}, my_generation)
                     time.sleep(0.03)
                 if _stop_requested:
                     winsound.PlaySound(None, 0)
+                if superseded():
+                    # A newer speak took over while this chunk played —
+                    # the takeover already cancelled audio; drop this
+                    # worker's remaining chunks without touching state.
+                    break
 
                 # Advance the cumulative playback time for word-timing offsets.
                 chunk_offset_ms += chunk_duration_s * 1000.0
-                if ci < len(chunks) - 1 and inter_chunk_pause > 0 and not _stop_requested:
+                if ci < len(chunks) - 1 and inter_chunk_pause > 0 and not _stop_requested and not superseded():
                     time.sleep(inter_chunk_pause)
                     chunk_offset_ms += inter_chunk_pause * 1000.0
         finally:
@@ -653,10 +697,22 @@ def handle_speak(text: str, from_word: int = 0) -> dict[str, str]:
             # No audio ever started — likely stopped before chunk 0 finished.
             logging.info("Stopped before first audio; total elapsed %.3fs", time.time() - t_start)
         else:
-            logging.info("All chunks played; total %.3fs", time.time() - t_start)
+            logging.info("All chunks played; total elapsed %.3fs", time.time() - t_start)
 
-        _stop_requested = True  # signal any pending synth worker to stop
-        _write_highlight_state({"state": "done"})
+        # Exit path: a SUPERSEDED worker (its takeover join timed out
+        # mid-synth) must neither re-assert the stop flag — which used to
+        # poison the new read's chunk loop within 30ms — nor write a late
+        # "done" on top of the new read's packets (the panel-vanish
+        # trigger). Only the CURRENT generation owns the terminal state.
+        if my_generation == _speak_generation:
+            _stop_requested = True  # signal any pending synth worker to stop
+            _write_highlight_state({"state": "done"})
+        else:
+            logging.info(
+                "Superseded worker (gen %d, current %d) exiting silently",
+                my_generation,
+                _speak_generation,
+            )
 
     return {"status": "ok", "message": "Text spoken"}
 
@@ -910,6 +966,12 @@ def serve() -> int:
             except Exception:
                 pass
             _speak_thread.join(timeout=3.0)
+        # Bump the generation AFTER the takeover: this request's worker
+        # owns the highlight state from here on; the previous worker's
+        # late writes are dropped by the generation guard (a timed-out
+        # join leaves it alive mid-synth, so those late writes are real).
+        global _speak_generation
+        _speak_generation += 1
         _speak_thread = threading.Thread(target=_worker, daemon=True)
         _speak_thread.start()
         return {"status": "ok", "message": "Speak started"}
