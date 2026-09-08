@@ -1355,7 +1355,8 @@ OverlayClickHandler(wParam, lParam, msg, hwnd) {
     ; RichEdit returns the flat char index (up to 0x7FFFFFFE — no low-word
     ; mask, unlike the classic Edit's packed return).
     ; Find which word this char belongs to.
-    idx := FindWordByChar(HighlightWords, charIdx)
+    idx := FindNearestWordByChar(HighlightWords, charIdx)
+    DebugLog "Click: px=" . px . " py=" . py . " charIdx=" . charIdx . " wordIdx=" . idx
     if (idx >= 0) {
         SeekFromWord(idx)
     }
@@ -1477,6 +1478,35 @@ FindWordByChar(words, charIdx) {
     return -1
 }
 
+; Click-to-seek must resolve EVERY click on the text surface, not just
+; clicks that happen to land on letter pixels: EM_CHARFROMPOS happily
+; returns the index of a SPACE between words (a click at a word gap
+; returned charIdx=30 with wordIdx=-1 in live testing — "click a word,
+; nothing happens"). Snap outward from the clicked char to the nearest
+; word, LEFT-preferred on ties: reading flows left-to-right, so a click
+; in the gap after a word most naturally means that word. Scan window
+; is 10 chars — covers inter-word spaces and sentence gaps; a click
+; far off any word (panel padding) still no-ops via -1.
+FindNearestWordByChar(words, charIdx) {
+    exact := FindWordByChar(words, charIdx)
+    if (exact >= 0) {
+        return exact
+    }
+    offset := 1
+    while (offset <= 10) {
+        left := FindWordByChar(words, charIdx - offset)
+        if (left >= 0) {
+            return left
+        }
+        right := FindWordByChar(words, charIdx + offset)
+        if (right >= 0) {
+            return right
+        }
+        offset++
+    }
+    return -1
+}
+
 SeekFromWord(idx) {
     global HighlightFullText, RequestPath, ResponsePath, HighlightPath
     global HighlightCurrentIdx, gSeekInFlight, gLastSeekTick
@@ -1488,6 +1518,7 @@ SeekFromWord(idx) {
     ; storm artifact, not new intent; drop it before touching state.
     now := A_TickCount
     if (now - gLastSeekTick < 200) {
+        DebugLog "Seek: debounced (idx=" . idx . " " . (now - gLastSeekTick) . "ms since last)"
         return
     }
     gLastSeekTick := now
