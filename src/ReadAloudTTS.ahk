@@ -57,10 +57,21 @@ global OverlayStatusCtrl := ""
 ; DPI scale for overlay geometry (per-monitor: read at build time).
 global gOverlayDpi := 96
 ; Session memory of the user's dragged panel position: rebuilds reuse
-; the last dragged spot instead of snapping to bottom-center every read.
+; the last dragged spot instead of snapping back to bottom-center every read.
 ; -1,-1 = never dragged (use default position).
 global gOverlayDraggedX := -1
 global gOverlayDraggedY := -1
+; UI zoom scale for the overlay (user-requested drag-to-scale + Ctrl+wheel
+; 2026-09-08). ONE multiplier composes with the DPI scale everywhere the panel
+; is built: width/height/margins/font twips all derive from uiScale =
+; dpiScale * gOverlayScale, so a zoom keeps the panel's proportions (the
+; "dynamic & responsive resizing" ask). Clamp 0.75..2.0: below 0.75 the
+; status line would shrink below legibility; above 2.0 the panel outgrows a
+; 1080p work area. Session-only like dragged-position (a restart resets to
+; 1.0 — deliberate: this is a readability aid for the current sitting, not a
+; persistent preference) and every rebuild re-applies it, so a mid-read zoom
+; survives the panel rebuilds that follow seeks/restarts.
+global gOverlayScale := 1.0
 ; Per-read "Esc dismissed the panel" flag. The tick's playing stream must
 ; NOT resurrect a panel the user just dismissed: without this, Esc
 ; destroys the Gui and the next 30ms tick (state=playing, gui="") hits
@@ -75,6 +86,18 @@ global gDragOffY := 0
 global gDragStartX := 0
 global gDragStartY := 0
 global gDragMoved := false
+; Corner-grip drag-to-scale state: a press on the bottom-right grip zone
+; scales the panel (dx+dy → gOverlayScale) instead of moving it. The grip
+; shares the drag model: offsets captured at press, a 16ms timer tracks
+; until release, a 4px dead zone separates click from drag.
+global gDragScaling := false
+global gDragScaleStart := 1.0
+global gDragScaleStartX := 0
+global gDragScaleStartY := 0
+global gDragScaleMoved := false
+; Corner grip glyph control (bottom-right, dim — a discoverability hint
+; for the drag-to-scale surface, right next to the "Ctrl+wheel zooms" copy).
+global OverlayGripCtrl := ""
 
 DirCreate TempDir
 ; Brand the tray — without this the taskbar shows AutoHotkey's generic icon.
@@ -143,6 +166,15 @@ OnMessage(0x201, OverlayClickHandler)
 ; handler below. (Losing native dblclick behavior is nothing — this
 ; surface's only click verb is seek.)
 OnMessage(0x203, OverlayDoubleClickSuppress)
+; Ctrl+wheel zoom on the overlay (user feature 2026-09-08). Win10/11
+; posts WM_MOUSEWHEEL directly to the window under the cursor (Raymond Chen
+; 2016-04-20), so this fires with the pointer over the panel even while
+; another app holds focus. The handler returns an integer for panel/
+; RichEdit targets — suppressing further processing is what stops BOTH the
+; RichEdit's native wheel scroll AND its built-in Ctrl+wheel zoom (RichEdit
+; 4.1 zooms natively; unsuppressed we'd double-step). Gated on Ctrl: a
+; bare wheel over the panel stays native so any scroll instinct still works.
+OnMessage(0x020A, OverlayWheelZoomHandler)
 
 StartDaemon()
 
@@ -680,9 +712,29 @@ ResetSpeed() {
     TrayTip "Normal speed", "ReadAloudTTS Speed"
 }
 
+global gDebugLogWrites := 0
 DebugLog(msg) {
-    global TempDir
+    global TempDir, gDebugLogWrites
     logPath := TempDir . "\working_debug.log"
+    ; Over-time stability (research 2026-09-08): the log grew ~1.2MB/day in
+    ; real use — unbounded FileAppend over a days-long tray session eats
+    ; disk and slows tailing. Rotate at 2MB, keeping one .1 generation.
+    ; Size check amortized: one stat per 500 writes, not per line.
+    gDebugLogWrites += 1
+    if (Mod(gDebugLogWrites, 500) = 0) {
+        try {
+            if FileExist(logPath) {
+                sizeMB := FileGetSize(logPath, "K") / 1024.0
+                if (sizeMB >= 2.0) {
+                    old := logPath . ".1"
+                    if FileExist(old) {
+                        FileDelete old
+                    }
+                    FileMove logPath, old, 1
+                }
+            }
+        }
+    }
     ts := FormatTime(A_Now, "yyyy-MM-dd HH:mm:ss")
     try FileAppend "[" . ts . "] " . msg . "`n", logPath, "UTF-8-RAW"
 }
@@ -1099,6 +1151,10 @@ ShowHighlightOverlayInner(text) {
         gOverlayDpi := 96
     }
     dpiScale := gOverlayDpi / 96.0
+    ; uiScale = DPI * zoom: one composed multiplier drives ALL panel geometry
+    ; so a zoom scales the panel as a unit (proportions preserved), not just
+    ; the font (which would reflow the same-size box into fewer lines).
+    uiScale := dpiScale * gOverlayScale
     gOverlayReducedMotion := !ReducedMotionEnabled()
     ; Typography (Apple HIG x Material 3 contract + ChatGPT teardown):
     ; 16px-class body type (weight 400, generous leading) — the old
@@ -1108,15 +1164,22 @@ ShowHighlightOverlayInner(text) {
     ; CHARFORMAT so the RichEdit honors it, but SetFont on the Gui first
     ; gives the fallback a baseline.
     fontName := "Segoe UI Variable Text"
-    HighlightGui.SetFont("s" . Round(13 * dpiScale), fontName)
+    HighlightGui.SetFont("s" . Round(13 * uiScale), fontName)
     ; Near-opaque dark panel (research: composited text on translucent
     ; panels fails WCAG 4.5:1 worst-case; 243/255 ≈ 95% keeps a whisper
     ; of depth while guaranteeing contrast), ~52% of screen width,
     ; bottom-center. Taller than the old 80px strip: two lines of 16px
     ; text plus comfortable padding (Gemini/ChatGPT composer feel).
     screenWidth := A_ScreenWidth
-    panelWidth := Round(screenWidth * 0.52)
-    panelHeight := Round(108 * dpiScale)
+    ; Width scales with zoom too (a bigger font in the same-width box reads
+    ; as a reflow, not a zoom) but clamps just short of fullscreen so a
+    ; 2x panel never runs off the right edge.
+    panelWidth := Round(screenWidth * 0.52 * uiScale)
+    maxW := screenWidth - Round(16 * uiScale)
+    if (panelWidth > maxW) {
+        panelWidth := maxW
+    }
+    panelHeight := Round(108 * uiScale)
     panelX := Round((screenWidth - panelWidth) / 2)
     panelY := A_ScreenHeight - panelHeight - Round(56 * dpiScale)
     ; Dragged-position memory: if the user moved the panel, rebuilds
@@ -1130,15 +1193,15 @@ ShowHighlightOverlayInner(text) {
             panelY := gOverlayDraggedY
         }
     }
-    HighlightGui.MarginX := Round(18 * dpiScale)
-    HighlightGui.MarginY := Round(14 * dpiScale)
+    HighlightGui.MarginX := Round(18 * uiScale)
+    HighlightGui.MarginY := Round(14 * uiScale)
     ; RichEdit50W styles (verified vs MS SDK richedit.h + AHK shipping
     ; examples): WS_CHILD|WS_VISIBLE (0x50000000) + ES_MULTILINE|ES_READONLY
     ; (0x804). Deliberately NO ES_NOHIDESEL: on this never-focused panel
     ; the selection stays INVISIBLE by default — the visible signal is
     ; the amber word color, not a selection block. ES_SAVESEL not needed
     ; (we never rely on selection persistence).
-    reStyle := "ClassRichEdit50W +0x50000804 -Tabstop -VScroll w" . (panelWidth - Round(36 * dpiScale)) . " h" . (panelHeight - Round(52 * dpiScale))
+    reStyle := "ClassRichEdit50W +0x50000804 -Tabstop -VScroll w" . (panelWidth - Round(36 * uiScale)) . " h" . (panelHeight - Round(52 * uiScale))
     reCtrl := HighlightGui.AddCustom(reStyle)
     DebugLog "  AddCustom ok hwnd=" . reCtrl.Hwnd
     ; Status line under the text: pause state must be VISIBLE (the old
@@ -1146,9 +1209,22 @@ ShowHighlightOverlayInner(text) {
     ; copy teaches the Space control; on pause it flips to amber
     ; "⏸ paused — Space resumes". Tiny, dim gray #9A9AA5 on the panel
     ; BackColor — never competes with the amber word.
-    OverlayStatusCtrl := HighlightGui.Add("Text", "x" . Round(18 * dpiScale) . " w" . (panelWidth - Round(36 * dpiScale)) . " h" . Round(18 * dpiScale) . " c9A9AA5 Background16161D", "  Space pauses · click a word to jump")
-    HighlightGui.SetFont("s8", "Segoe UI Variable Text")
-    OverlayStatusCtrl.SetFont("s8 c9A9AA5")
+    OverlayStatusCtrl := HighlightGui.Add("Text", "x" . Round(18 * uiScale) . " w" . (panelWidth - Round(36 * uiScale)) . " h" . Round(18 * uiScale) . " c9A9AA5 Background16161D", "  Space pauses · click a word to jump · Ctrl+wheel zooms")
+    HighlightGui.SetFont("s" . Round(8 * uiScale), "Segoe UI Variable Text")
+    OverlayStatusCtrl.SetFont("s" . Round(8 * uiScale) . " c9A9AA5")
+    ; Corner grip glyph (bottom-right): the drag-to-scale affordance. A
+    ; triangle glyph (U+25E2) reads as "pull corner to grow" — the standard
+    ; resize affordance — and stays dim so it never competes with the amber
+    ; word. The grip ZONE (hit test in OverlayDragHandler) is the bottom-
+    ; right ~20x20 area of the panel, not this control's exact pixels: the
+    ; glyph is the visual hint, the zone is the functional surface.
+    try {
+        OverlayGripCtrl := HighlightGui.Add("Text", "x" . (panelWidth - Round(30 * uiScale)) . " y" . (panelHeight - Round(28 * uiScale)) . " w" . Round(16 * uiScale) . " h" . Round(16 * uiScale) . " c3F3F46 Background16161D Right", "◢")
+        OverlayGripCtrl.SetFont("s" . Round(9 * uiScale), "Segoe UI")
+    } catch as e {
+        DebugLog "  grip glyph failed: " . e.Message
+        OverlayGripCtrl := ""
+    }
     ; --- RichEdit init (research gotchas, in order) ---
     reHwnd := reCtrl.Hwnd
     ; EM_SETUNDOLIMIT 0: per-word recoloring creates undo records at 3+/s
@@ -1170,7 +1246,7 @@ ShowHighlightOverlayInner(text) {
     ; SCF_ALL (0x4 — NOT 0x8, which is SCF_USEUIRULES) with CFM_FACE|
     ; CFM_SIZE|CFM_COLOR. yHeight is TWIPS (points x 20): 16pt-class
     ; readable body = 320 twips (scaled by DPI at build time).
-    cf := MakeCharFormat(0x20000000 | 0x80000000 | 0x40000000, 0, Round(320 * dpiScale), 0xE8E8E8, fontName)
+    cf := MakeCharFormat(0x20000000 | 0x80000000 | 0x40000000, 0, Round(320 * uiScale), 0xE8E8E8, fontName)
     docFmtRet := SendMessage(0x0444, 4, cf.Ptr, reHwnd)
     DebugLog "  EM_SETCHARFORMAT(SCF_ALL) ret=" . docFmtRet
     ; Word-wrap is ON by default in RichEdit — no EM_FMTLINES call needed
@@ -1237,17 +1313,18 @@ OverlayHoverPause(*) {
 ; the resume hint; playing = the dim control hint. Reduced motion does
 ; not gate this (it's an instant text swap, no animation).
 SetOverlayStatus(paused) {
-    global OverlayStatusCtrl, HighlightGui
+    global OverlayStatusCtrl, HighlightGui, gOverlayScale
     if (HighlightGui = "" or OverlayStatusCtrl = "") {
         return
     }
     try {
+        s := Round(8 * gOverlayScale)
         if (paused) {
-            OverlayStatusCtrl.SetFont("s8 cF2C14E")
+            OverlayStatusCtrl.SetFont("s" . s . " cF2C14E")
             OverlayStatusCtrl.Text := "  ⏸ paused — Space resumes"
         } else {
-            OverlayStatusCtrl.SetFont("s8 c9A9AA5")
-            OverlayStatusCtrl.Text := "  Space pauses · click a word to jump"
+            OverlayStatusCtrl.SetFont("s" . s . " c9A9AA5")
+            OverlayStatusCtrl.Text := "  Space pauses · click a word to jump · Ctrl+wheel zooms"
         }
     }
 }
@@ -1398,12 +1475,75 @@ OverlayDoubleClickSuppress(wParam, lParam, msg, hwnd) {
     return 1   ; swallow — no native word-select on this surface
 }
 
+; Ctrl+wheel over the overlay = zoom (user feature 2026-09-08). Win10/11
+; posts WM_MOUSEWHEEL directly to the window under the cursor (Raymond Chen
+; 2016-04-20), so this fires while another app holds focus — but that also
+; means the RichEdit child receives wheel messages natively, and RichEdit 4.1
+; zooms on Ctrl+wheel BUILT-IN. The integer return at the bottom suppresses
+; ALL further processing of the message (AHK v2 OnMessage semantics), which
+; is what stops the native double-zoom. Bare wheel (no Ctrl) stays native.
+OverlayWheelZoomHandler(wParam, lParam, msg, hwnd) {
+    global HighlightGui, gOverlayScale, gDragScaling
+    if (HighlightGui = "") {
+        return
+    }
+    ; Don't fight an in-progress grip drag (its math anchors to the scale
+    ; at press; a mid-drag wheel step would snap back on the next tick).
+    if (gDragScaling) {
+        return 1
+    }
+    ; Ctrl gate — MK_CONTROL = 0x0008 in wParam's low word.
+    if ((wParam & 0xFFFF & 0x0008) = 0) {
+        return
+    }
+    ; Accept the wheel anywhere over the panel: the OS posts to whichever
+    ; child is under the cursor (panel, RichEdit, status line, grip glyph),
+    ; so walk up the parent chain instead of enumerating children. The
+    ; transcript window (a sibling Gui) fails the walk and stays native.
+    walk := hwnd
+    found := false
+    loop 8 {
+        if (walk = HighlightGui.Hwnd) {
+            found := true
+            break
+        }
+        parent := DllCall("GetParent", "ptr", walk, "ptr")
+        if (parent = 0) {
+            break
+        }
+        walk := parent
+    }
+    if (!found) {
+        return
+    }
+    ; Wheel delta: SIGNED short in wParam's HIGH word (negative = toward
+    ; user = zoom out). Mask-then-sign — a raw >>16 reads AHK's unsigned
+    ; wParam and turns every zoom-out into a huge positive.
+    d := (wParam >> 16) & 0xFFFF
+    if (d >= 0x8000) {
+        d -= 0x10000
+    }
+    ; One notch (±120) = ±10%; high-resolution deltas scale with |delta|,
+    ; capped at 3 notches so a single flick can't jump the clamp range.
+    steps := d / 120.0
+    if (steps > 3) {
+        steps := 3
+    }
+    if (steps < -3) {
+        steps := -3
+    }
+    ApplyOverlayScale(gOverlayScale * (1.1 ** steps))
+    return 1   ; integer return: suppress native scroll AND native Ctrl+wheel zoom
+}
+
 OverlayDragHandler(wParam, lParam, msg, hwnd) {
     ; Manual drag for the NOACTIVATE overlay: left button on the PANEL
     ; (not the Edit) starts a Windows-standard drag. The Edit consumes
     ; its own clicks (click-to-rewind); the panel margins are the grab
     ; zone. Uses the mouse-move stream already driven by the tick.
     global HighlightGui, gDragOffX, gDragOffY
+    global gOverlayDpi, gOverlayScale, gDragScaling, gDragScaleStart
+    global gDragScaleStartX, gDragScaleStartY, gDragScaleMoved
     if (HighlightGui = "" or hwnd != HighlightGui.Hwnd) {
         return
     }
@@ -1414,6 +1554,26 @@ OverlayDragHandler(wParam, lParam, msg, hwnd) {
     ; first Move; the offset is captured here.
     CoordMode "Mouse", "Screen"
     MouseGetPos &mx, &my
+    ; GRIP ZONE branch: a press in the bottom-right corner (the ◢ glyph
+    ; is the visual hint) starts a SCALE drag, not a move drag. Zone =
+    ; 24x24 at panel scale (px scaled with uiScale so it stays grabbable
+    ; when zoomed) measured from the panel's bottom-right corner, using
+    ; screen coords (press position minus panel origin). The same 4px
+    ; dead zone + release-persist model as the move drag.
+    WinGetPos &wx, &wy, &ww, &wh, "ahk_id " . HighlightGui.Hwnd
+    dpiScale2 := gOverlayDpi / 96.0
+    uiScale2 := dpiScale2 * gOverlayScale
+    gz := Round(24 * uiScale2)
+    if (mx >= wx + ww - gz and mx <= wx + ww and my >= wy + wh - gz and my <= wy + wh) {
+        gDragScaling := true
+        gDragScaleStart := gOverlayScale
+        gDragScaleStartX := mx
+        gDragScaleStartY := my
+        gDragScaleMoved := false
+        DebugLog "ScaleDrag armed at " . mx . "," . my
+        SetTimer DragScaleTrackOverlay, 16
+        return 1   ; consume: not a move-drag press
+    }
     WinGetPos &wx, &wy,,, "ahk_id " . HighlightGui.Hwnd
     gDragOffX := mx - wx
     gDragOffY := my - wy
@@ -1463,6 +1623,164 @@ DragTrackOverlay() {
         gDragMoved := true
     }
     HighlightGui.Move(mx - gDragOffX, my - gDragOffY)
+}
+
+; Scale-drag tracker (grip corner): until left-button release, map pointer
+; travel to a scale delta. dx+dy diagonal travel = grow (pulling the corner
+; outward/down), reverse = shrink — both axes summed so the grip works at
+; any grab angle. Sensitivity: 480px of diagonal travel = 2x panel (1px ≈
+; 0.21% scale) — deliberate, not twitchy. Dead zone mirrors the move drag
+; (a press that hasn't travelled is a click, not a scale). Keep the panel's
+; TOP-LEFT anchored while scaling so the grip corner tracks the pointer —
+; the natural corner-pull mental model.
+DragScaleTrackOverlay() {
+    global HighlightGui, gDragScaling, gDragScaleStart, gDragScaleMoved
+    global gDragScaleStartX, gDragScaleStartY, gOverlayScale
+    if (!gDragScaling) {
+        SetTimer DragScaleTrackOverlay, 0
+        return
+    }
+    if (HighlightGui = "") {
+        gDragScaling := false
+        SetTimer DragScaleTrackOverlay, 0
+        return
+    }
+    if !GetKeyState("LButton", "P") {
+        SetTimer DragScaleTrackOverlay, 0
+        gDragScaling := false
+        DebugLog "ScaleDrag end scale=" . Format("{:.2f}", gOverlayScale)
+        return
+    }
+    CoordMode "Mouse", "Screen"
+    MouseGetPos &mx, &my
+    if (!gDragScaleMoved) {
+        if (Abs(mx - gDragScaleStartX) < 4 and Abs(my - gDragScaleStartY) < 4) {
+            return
+        }
+        gDragScaleMoved := true
+    }
+    travel := (mx - gDragScaleStartX) + (my - gDragScaleStartY)
+    ApplyOverlayScale(gDragScaleStart * (1.0 + travel / 480.0))
+}
+
+; Live-apply a new overlay scale (wheel step or grip drag). This is the
+; heavy path: a full EM_SETCHARFORMAT SCF_ALL re-wrap at the new font size
+; plus Gui.Move — NOT EM_SETZOOM (the pure view transform works on RichEdit
+; 4.1 but zooms only the text inside a fixed box; the panel would stay the
+; same size, which reads as a reflow, not the "panel grows as a unit" zoom
+; the user asked for). Steps, in order, all armored — a throw inside a
+; 16ms timer callback kills every hotkey (the modal-dialog lesson):
+;  1. clamp + no-op check
+;  2. Gui.Move to the new panel box, top-left anchored, clamped on-screen
+;  3. RichEdit child Move to the new inner box
+;  4. SCF_ALL re-wrap at the new font twips (resets per-char formats to
+;     base — the amber word repaints base gray, so it MUST be re-colored)
+;  5. invalidate the change-gate (gLastSel*) so the next tick re-colors
+;     instead of no-oping on "unchanged" — plus re-color + re-anchor NOW,
+;     not at the next word: a mid-pause zoom would otherwise leave the
+;     amber word gray until the next word boundary (could be minutes).
+;  6. re-anchor the amber word into view (the re-wrap invalidated the old
+;     scroll position: EM_SETSCROLLPOS semantics are "self-clamping", not
+;     "survives reflow") + re-apply status font.
+ApplyOverlayScale(newScale) {
+    global HighlightGui, gOverlayScale, gOverlayDpi, OverlayStatusCtrl, OverlayGripCtrl
+    global HighlightWords, HighlightCurrentIdx, HighlightLastColored
+    global gLastSelStart, gLastSelEnd, gCfAmber, gCfBase, HighlightPaused
+    if (HighlightGui = "") {
+        return
+    }
+    if (newScale > 2.0) {
+        newScale := 2.0
+    }
+    if (newScale < 0.75) {
+        newScale := 0.75
+    }
+    if (Abs(newScale - gOverlayScale) < 0.005) {
+        return
+    }
+    gOverlayScale := newScale
+    uiScale := (gOverlayDpi / 96.0) * gOverlayScale
+    screenWidth := A_ScreenWidth
+    panelWidth := Round(screenWidth * 0.52 * uiScale)
+    maxW := screenWidth - Round(16 * uiScale)
+    if (panelWidth > maxW) {
+        panelWidth := maxW
+    }
+    panelHeight := Round(108 * uiScale)
+    try {
+        ; Top-left anchored: the grip corner tracks the pointer; for wheel
+        ; zoom keep the top-left too (the status line stays under the same
+        ; reading spot). Clamp on-screen (a 2x panel near the right edge
+        ; would otherwise run off).
+        WinGetPos &px, &py,,, "ahk_id " . HighlightGui.Hwnd
+        if (px + panelWidth > screenWidth) {
+            px := screenWidth - panelWidth
+        }
+        if (px < 0) {
+            px := 0
+        }
+        if (py + panelHeight > A_ScreenHeight) {
+            py := A_ScreenHeight - panelHeight
+        }
+        if (py < 0) {
+            py := 0
+        }
+        HighlightGui.Move(px, py, panelWidth, panelHeight)
+        ; RichEdit child: same inset math as the build (x/y = Gui margins
+        ; 18/14, w = panel minus 36, h = panel minus 52). x/y MUST be re-
+        ; derived, not kept: a kept x drifts the left inset as the margin
+        ; rescales, and a kept y lets the taller text box run over the
+        ; status line below it.
+        try {
+            reCtrl := HighlightGui["RichEdit50W1"]
+            reCtrl.Move(Round(18 * uiScale), Round(14 * uiScale), panelWidth - Round(36 * uiScale), panelHeight - Round(52 * uiScale))
+        } catch {
+        }
+        ; Status line + grip glyph ride along — status y re-derived to match
+        ; the build's auto-layout exactly: MarginY(14) + RichEdit h(H-52) +
+        ; gap(14) = H-24 from the panel top (52 decomposes 14+14+18+6).
+        if (IsObject(OverlayStatusCtrl)) {
+            try OverlayStatusCtrl.Move(Round(18 * uiScale), panelHeight - Round(24 * uiScale), panelWidth - Round(36 * uiScale), Round(18 * uiScale))
+        }
+        if (IsObject(OverlayGripCtrl)) {
+            try OverlayGripCtrl.Move(panelWidth - Round(30 * uiScale), panelHeight - Round(28 * uiScale))
+        }
+        ; SCF_ALL re-wrap at the new size. This resets every char's format
+        ; to base — the live amber word repaints gray until re-colored
+        ; below. CFM_FACE|CFM_SIZE|CFM_COLOR so face + size + color all
+        ; re-bind (size is the whole point).
+        reHwnd := 0
+        try reHwnd := HighlightGui["RichEdit50W1"].Hwnd
+        if (reHwnd != 0) {
+            cf := MakeCharFormat(0x20000000 | 0x80000000 | 0x40000000, 0, Round(320 * uiScale), 0xE8E8E8, "Segoe UI Variable Text")
+            SendMessage(0x0444, 4, cf.Ptr, reHwnd)
+            ; Re-color the current amber word NOW (don't wait for the next
+            ; word boundary — under pause that's minutes away) and re-anchor
+            ; it into the band. Also reset the change-gate so the tick's
+            ; SelectOverlayWord doesn't no-op on "same word": a no-op would
+            ; skip both the recolor and the ScrollWordIntoView re-anchor.
+            idx := HighlightCurrentIdx
+            if (idx >= 0 and idx <= HighlightWords.Length - 1) {
+                wordInfo := HighlightWords[idx + 1]
+                if (wordInfo[4] >= 0 and wordInfo[5] >= 0) {
+                    EnsureCharFormatPair("Segoe UI Variable Text")
+                    ColorWordRange(reHwnd, wordInfo[4], wordInfo[5], gCfAmber)
+                }
+                gLastSelStart := -1
+                gLastSelEnd := -1
+                ScrollWordIntoView(reHwnd, wordInfo[4])
+            } else {
+                gLastSelStart := -1
+                gLastSelEnd := -1
+            }
+            ; Line pitch depends on font size: ScrollWordIntoView measures
+            ; it live every call, so the re-anchor above already used the
+            ; post-reflow pitch. No cached pitch to fix.
+        }
+        SetOverlayStatus(HighlightPaused)
+    } catch as e {
+        DebugLog "ApplyOverlayScale failed: " . e.Message . " @ " . e.What
+    }
 }
 
 FindWordByChar(words, charIdx) {
@@ -1733,10 +2051,14 @@ ScrollWordIntoView(reHwnd, charIdx) {
 }
 
 HideHighlightOverlay() {
-    global HighlightGui, HighlightPaused, HighlightCurrentIdx
+    global HighlightGui, HighlightPaused, HighlightCurrentIdx, OverlayGripCtrl
     if HighlightGui != "" {
         try HighlightGui.Destroy()
         HighlightGui := ""
+        ; Null the per-build control refs with the Gui they belong to —
+        ; a stale Gui object reference survives Destroy (AHK v2 destroys
+        ; the windows but the OBJECT lives while any variable holds it).
+        OverlayGripCtrl := ""
     }
     ; Preserve pause/position when a hover-pause teardown lands here —
     ; wiping them made mouse-leave resume impossible (the resume branch
