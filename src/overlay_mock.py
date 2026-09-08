@@ -32,10 +32,9 @@ sys.path.insert(0, str(SRC_DIR))
 
 from overlay_server import OverlayServer  # noqa: E402
 
-# The component lives as a sibling repo: <component source>
-COMPONENT_ROOT = SRC_DIR.parents[0] / "read-along" / "src"
-if not COMPONENT_ROOT.is_dir():
-    COMPONENT_ROOT = SRC_DIR.parent.parent / "read-along" / "src"
+# The vendored component ships beside this file (src/component -> the
+# install dir's component/ after install.ps1 copies it).
+COMPONENT_ROOT = SRC_DIR / "component"
 
 # ~29 words — same shape the alignment proof used, incl. punctuation,
 # an em-dash, quotes and a URL.

@@ -30,3 +30,11 @@ Voice models are downloaded separately by the user. Each voice can have its own 
 - Voice source: https://huggingface.co/rhasspy/piper-voices
 - Distribution note: this repository does not bundle ONNX voice files or downloaded voice JSON files.
 - Review `docs/VOICE_LICENSING.md` before using any voice for commercial or public work.
+
+### read-along web component
+
+The loopback web overlay renders with the read-along web component, bundled under `src/component/`.
+
+- Author: LE-VAI (same author as this repository).
+- License: MIT — the same terms as this repository's LICENSE.
+- Distribution note: this repository bundles the component's source (six files: `read-along.js`, `read-along.css`, `tokenizer.js`, `highlight.js`, `engines/external.js`, `engines/webspeech.js`). The overlay server serves a fixed whitelist of these files from the install folder, loopback-only.

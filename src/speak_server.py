@@ -912,7 +912,9 @@ def serve() -> int:
         state_source=file_state_source(_HIGHLIGHT_PATH),
         text_source=file_text_source(APP_DIR / "tmp" / "overlay_text.json"),
         request_sink=file_request_sink(APP_DIR / "tmp" / "request.json"),
-        component_root=Path(config.get("component_root", r"<component source>")),
+        # The bundled component (src/component -> install component/) is
+        # the default; config can point elsewhere for local development.
+        component_root=Path(config.get("component_root", APP_DIR / "component")),
         highlight_color=config.get("highlight_color"),
         host="127.0.0.1",
         port=overlay_port,

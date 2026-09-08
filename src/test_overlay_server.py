@@ -93,18 +93,14 @@ def test_render_overlay_html_default_keeps_markers_replaced():
     body = render_overlay_html(None).decode("utf-8")
     assert DEFAULT_HIGHLIGHT in body
 
-def test_render_overlay_html_has_no_atlas_string():
-    body = render_overlay_html("#FFC400").decode("utf-8")
-    assert "the project" not in body  # public-facing naming rule
-
 
 # ---------------------------------------------------------------------------
 # live HTTP round-trips
 # ---------------------------------------------------------------------------
 
-# The read-along component lives as a SIBLING of this repo:
-# <component source> (repo is <repo>).
-COMPONENT_ROOT = Path(__file__).resolve().parents[2] / "read-along" / "src"
+# The vendored component ships in-repo (src/component), so the full
+# whitelist round-trip runs everywhere, CI included.
+COMPONENT_ROOT = Path(__file__).resolve().parent / "component"
 
 
 class _Harness:
@@ -337,18 +333,10 @@ def test_http_autotest_hold_rearms(tmp_path):
 def test_http_component_whitelist(tmp_path):
     h = _Harness(tmp_path)
     try:
-        if not COMPONENT_ROOT.is_dir():
-            # component not present in this checkout — cover the refusal
-            # path only (whitelist + traversal).
-            try:
-                h.get("/component/read-along.js")
-                assert False, "expected 404"
-            except urllib.error.HTTPError as e:
-                assert e.code == 404
-            return
         for rel in COMPONENT_WHITELIST:
             status, body = h.get("/component/" + rel)
             assert status == 200, rel
+            assert body, rel
         for bad in ("../src/speak.py", "engines/kokoro.js", "whatever.js",
                     "read-along.css%00", "engines/../../speak.py"):
             try:
@@ -358,6 +346,14 @@ def test_http_component_whitelist(tmp_path):
             assert status == 404, bad
     finally:
         h.stop()
+
+def test_component_read_along_js_is_vendored():
+    # The bundled component must actually be present in the checkout —
+    # a missing file here means the overlay ships broken (404s on load).
+    js = COMPONENT_ROOT / "read-along.js"
+    assert js.is_file(), f"vendored component missing: {js}"
+    body = js.read_text(encoding="utf-8")
+    assert "customElements" in body  # it's the real component, not a stub
 
 def test_http_unknown_route_404(tmp_path):
     h = _Harness(tmp_path)

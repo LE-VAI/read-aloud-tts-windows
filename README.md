@@ -25,6 +25,11 @@ ReadAloudTTS ships with several hotkeys so you can pick whichever fits your work
 | **Read selection** | `Home` | Single key. The main player. Fastest for daily use. |
 | Read selection | `Ctrl + Right-click` | The original gesture. Leaves normal right-click menus intact. |
 | **Stop speech** | `F6` | Single key. Cancels speech immediately, mid-sentence. |
+| Pause / resume reading | `Space` | While the reading panel is visible, with the pointer over it. |
+| Dismiss the reading panel | `Esc` | Hides the panel for this read; speech continues. |
+| Show last transcript | `Ctrl + Alt + T` | Opens the last-read text in a scrollable window (falls back to the clipboard if nothing was read yet). |
+| Move the reading panel | Drag its title area | The panel remembers where you put it. |
+| Zoom the reading panel | `Ctrl + wheel` over the panel, or drag its corner grip | 75%–200% scale. Works while reading; the active word re-anchors. |
 | **Speed up** | `Ctrl + *` (`Ctrl+Shift+8`) | 10% faster. Takes effect on the next chunk. |
 | **Speed down** | `Ctrl + /` | 10% slower. Takes effect on the next chunk. |
 | **Reset speed** | Tray menu → Speed | Cycles through presets back to normal. |
@@ -40,6 +45,8 @@ Hotkeys are plain AutoHotkey v2 bindings near the top of `ReadAloudTTS.ahk`. Rem
 | Offline speech | Uses locally installed Piper after voice download. |
 | Single-key read | Press `Home` on any selection to hear it instantly. No chord, no menu. |
 | Single-key stop | Press `F6` to cancel speech the moment you've heard enough — even mid-sentence. |
+| Reading panel | Karaoke-style follow-along panel with click-to-seek, Space pause, drag-to-move, and Ctrl+wheel / corner-grip zoom. |
+| Web overlay | Loopback-only karaoke viewer page that renders the full text in place and joins reads mid-word. |
 | On-the-fly speed | `Ctrl + *` / `Ctrl + /` to adjust speed; tray menu Speed item resets to normal. Persists across restarts. |
 | Clipboard care | Temporarily copies selection, then restores your previous clipboard contents. |
 | Natural cadence | Configurable sentence pauses, inter-chunk gaps, and Piper prosody knobs. |
@@ -50,6 +57,8 @@ Hotkeys are plain AutoHotkey v2 bindings near the top of `ReadAloudTTS.ahk`. Rem
 
 - Reads selected text from any app that supports normal copy.
 - Offers single-key hotkeys: `Home` to read, `F6` to stop — plus `Ctrl + Right-click` as an alternative read gesture.
+- Shows a reading panel that follows the speech word by word: click any word to jump there, `Space` to pause, `Ctrl + wheel` or the corner grip to zoom, `Esc` to dismiss it.
+- Serves a loopback karaoke viewer page for full-text, in-place reading on any screen (tray menu → Open Reading Overlay).
 - Restores your previous clipboard contents after temporarily copying the selected text.
 - Runs from the Windows tray with actions for reading, stopping, voice selection, config, and logs.
 - Uses Piper TTS locally after voices are downloaded.
@@ -115,6 +124,21 @@ powershell -NoProfile -ExecutionPolicy Bypass -File .\uninstall.ps1 -RemoveAppDa
 3. Press `F6` to stop speech.
 4. Use the tray menu to read, stop, change voice, open config, or open logs.
 
+## Reading panel
+
+ReadAloudTTS can show a **karaoke reading panel** while it speaks: a compact, always-on-top window that renders the text being read with the current word highlighted in amber. It appears automatically on each read when enabled (tray menu → **Word highlight box: On**), follows the speech word by word, and stays out of your way otherwise.
+
+What the panel does:
+
+- **Follows the speech** — the current word highlights and the view page-flips when the highlight marches past the visible lines, so the spoken line is always on screen.
+- **Click any word to read from there** — speech restarts from that word, mid-sentence included. Clicks that land between words snap to the nearest word, so the whole panel is clickable.
+- **Pause / resume with `Space`** — deliberate and visible: the pause indicator plus the frozen amber word show the state. Works only while the pointer is over the panel (or the panel is focused), so typing elsewhere is untouched.
+- **Zoom** — hold `Ctrl` and scroll the mouse wheel over the panel, or drag the corner grip, to scale it from 75% to 200%. The panel grows as one unit — text, spacing, and the status line all scale together — and the active word stays anchored while reading continues.
+- **Move it anywhere** — drag the panel by its top area; the position persists across reads. `Esc` dismisses it for the current read without stopping speech.
+- **Finished reads stay one click away** — a small **↻ Replay** bar appears for 8 seconds after a read ends; click it to re-read the same text from the start. No re-selecting needed.
+
+The panel is opt-in per install: toggle it with the tray menu's **Word highlight box** item (the choice persists in `config.json` as `highlight_overlay`).
+
 ## Reading overlay
 
 The daemon also serves a **karaoke viewer** page — the spoken text with each
@@ -137,15 +161,16 @@ text box:
 - **Join mid-read** — open the page any time during a read; it picks up the
   current text and position.
 
-The overlay reuses the [read-along](../read-along) web component in
-external-clock mode: the daemon owns the audio and the clock, the page only
-renders. If the page is closed, speech is unaffected.
+The overlay reuses the read-along web component (bundled under
+`src/component/` in this repo) in external-clock mode: the daemon owns
+the audio and the clock, the page only renders. If the page is closed,
+speech is unaffected.
 
 | Key | Default | Effect |
 | --- | --- | --- |
 | `overlay_port` | `8792` | Port the viewer serves on (127.0.0.1 only). A busy port disables the viewer with a log line — hotkeys and speech continue without it. |
 | `highlight_color` | `#FFC400` | Hex color for the active-word highlight (any `#RGB`/`#RRGGBB`). Served as plain `rgb()` values — exotic color functions can silently drop inside `::highlight()` paint rules. |
-| `component_root` | `<component source>` | Where the read-along component files live. The server serves a fixed whitelist from this root only. |
+| `component_root` | `<install dir>\component` | Where the overlay serves the read-along component files from. Defaults to the bundled copy; point it at a local read-along checkout to hack on the component. A fixed file whitelist is served from this root only. |
 
 A mock daemon (`src/overlay_mock.py`) drives the same state protocol without
 Piper — useful for testing the overlay UI and for screenshots:

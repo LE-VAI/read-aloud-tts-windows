@@ -93,7 +93,9 @@ $copyMap = @(
     @{ Source = Join-Path $srcDir "ReadAloudTTS.ahk"; Target = Join-Path $InstallDir "ReadAloudTTS.ahk" },
     @{ Source = Join-Path $srcDir "speak.py"; Target = Join-Path $InstallDir "speak.py" },
     @{ Source = Join-Path $srcDir "speak_server.py"; Target = Join-Path $InstallDir "speak_server.py" },
-    @{ Source = Join-Path $sourceDir "download_voices.ps1"; Target = Join-Path $InstallDir "download_voices.ps1" },
+    @{ Source = Join-Path $srcDir "overlay_server.py"; Target = Join-Path $InstallDir "overlay_server.py" },
+    @{ Source = Join-Path $srcDir "overlay.html"; Target = Join-Path $InstallDir "overlay.html" },
+    @{ Source = Join-Path $srcDir "download_voices.ps1"; Target = Join-Path $InstallDir "download_voices.ps1" },
     @{ Source = Join-Path $sourceDir "uninstall.ps1"; Target = Join-Path $InstallDir "uninstall.ps1" },
     @{ Source = Join-Path $sourceDir "config.example.json"; Target = Join-Path $InstallDir "config.example.json" },
     @{ Source = Join-Path $sourceDir "refresh-readaloud.ps1"; Target = Join-Path $InstallDir "refresh-readaloud.ps1" },
@@ -102,6 +104,13 @@ $copyMap = @(
 
 foreach ($item in $copyMap) {
     Copy-Item -LiteralPath $item.Source -Destination $item.Target -Force
+}
+
+# The karaoke overlay's web component ships vendored in src/component;
+# overlay_server.py imports it from the install dir by default.
+$componentSource = Join-Path $srcDir "component"
+if (Test-Path -LiteralPath $componentSource) {
+    Copy-Item -LiteralPath $componentSource -Destination (Join-Path $InstallDir "component") -Recurse -Force
 }
 
 $configTarget = Join-Path $InstallDir "config.json"

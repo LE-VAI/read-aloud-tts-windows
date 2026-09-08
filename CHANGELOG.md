@@ -1,8 +1,66 @@
 # Changelog
 
-## Unreleased - Reading overlay (0.9.0)
+## Unreleased (0.9.0) — Reading panel + web overlay
 
-### Added
+### Desktop reading panel
+
+#### Added
+- **Desktop reading panel — a karaoke follow-along window.** With the
+  panel enabled (tray menu → *Word highlight box*, persisted as
+  `highlight_overlay`), each read opens a compact always-on-top window
+  that renders the spoken text with the current word highlighted in
+  amber, page-flipping as the highlight advances so the spoken line
+  stays on screen.
+  - **Click any word to read from there** — speech restarts from the
+    clicked word; clicks that land between words snap to the nearest
+    one, so the whole panel is clickable.
+  - **`Space` pauses and resumes** while the pointer is over the panel
+    (or the panel is focused) — deliberate and visible, with typing
+    elsewhere untouched.
+  - **Zoom: `Ctrl + mouse wheel` over the panel, or drag the corner
+    grip** — scales the whole panel 75%–200% as one unit (text, spacing,
+    and status line together), re-anchors the highlighted word, and
+    keeps working mid-read. One multiplier composes with the DPI scale,
+    so zoom behaves identically on any display scaling.
+  - **Drag to move** — the panel position persists across reads.
+  - **`Esc` dismisses** the panel for the current read; speech
+    continues.
+  - **↻ Replay bar** — after a finished read, a small bar offers a
+    one-click re-read of the same text for 8 seconds.
+- **Tray menu**: *Word highlight box* toggle and *Open Reading Overlay*
+  items; `Ctrl+Alt+T` opens a scrollable transcript of the last read
+  (or the clipboard when nothing was read yet).
+- **Vendored read-along component** — the overlay's web component now
+  ships in-repo (`src/component/`, MIT), and `install.ps1` copies it
+  (plus `overlay_server.py` and `overlay.html`) into the install
+  folder. The overlay works out of the box on a fresh clone; the
+  `component_root` config key still points it at a local component
+  checkout for development.
+
+#### Fixed
+- **Page-flip follow** — on the read-only panel, the classic scroll
+  messages (EM_SCROLLCARET / EM_LINESCROLL / WM_VSCROLL) are no-ops, so
+  the view froze on the first two lines while the highlight marched on
+  ("dialogue frozen after the first few words"). The panel now scrolls
+  with EM_SETSCROLLPOS so the highlighted line becomes the top visible
+  line, with the line pitch measured live (correct at any zoom).
+- **Click-to-seek robustness** — a click-to-rewind race could vanish
+  the panel or flash a blue text selection; closed at both layers
+  (overlay rebuild and selection handling), and gap clicks snap to
+  the nearest word instead of silently doing nothing.
+- **Esc dismissal sticks** — an Esc-dismissed panel no longer resurrects
+  30ms later when the state tick rebuilds it.
+- **Hotkey guard** — an unguarded process-name query could throw a
+  modal error that killed every hotkey until restart.
+- **Debug log rotation** — the debug log grew unboundedly (~1.2MB/day
+  of tick lines); it now rotates at 2MB keeping one previous
+  generation, with the size check amortized over writes.
+- **Log flooding gated** — per-tick state lines (30/s idle) and the
+  per-seek OnStart detail lines are now transition-gated.
+
+### Web reading overlay
+
+#### Added
 - **Reading overlay — a karaoke viewer for the spoken text.** The daemon now
   serves a loopback-only page at `http://127.0.0.1:<overlay_port>/overlay`
   that renders the text being spoken with each word highlighted in place, in
@@ -34,7 +92,7 @@
   deterministically captures the final probe line
   (`autotest started=true seeked=true paused=true tok=12 … base=12`).
 
-### Fixed
+#### Fixed
 - **The invisible-highlight trap, caught in verification:** the overlay
   initially served the component without its `read-along.css`, so
   registered `::highlight()` ranges had no paint rule — ranges present,
@@ -102,8 +160,8 @@
 
 ### Added
 - **On-the-fly speed control** — adjust reading speed without restarting the daemon or reloading the voice model:
-  - `Ctrl+*` (`Ctrl+Shift+8`) = 10% faster (`*` = multiply = more speed mnemonic)
-  - `Ctrl+/` = 10% slower (`/` = divide = less speed mnemonic)
+  - `Ctrl+*` (`Ctrl+Shift+8`) = 10% faster (`*` = multiply = more speed, easy to remember)
+  - `Ctrl+/` = 10% slower (`/` = divide = less speed, easy to remember)
   - Tray menu "Speed:" item shows current speed and cycles through presets (normal → 1.2× slower → 1.5× slower → 0.8× faster) to reset
   - Avoids zoom conflict (`Ctrl+/-`) and works on compact keyboards (Logitech MX Keys) without Alt or numpad — `*` is `Shift+8`, `/` is its own key
   - Speed changes take effect on the **next chunk** being synthesized (standard TTS behavior — audio already playing is not affected)
