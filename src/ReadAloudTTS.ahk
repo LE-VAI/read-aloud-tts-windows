@@ -59,6 +59,14 @@ global gOverlayDpi := 96
 ; -1,-1 = never dragged (use default position).
 global gOverlayDraggedX := -1
 global gOverlayDraggedY := -1
+; Per-read "Esc dismissed the panel" flag. The tick's playing stream must
+; NOT resurrect a panel the user just dismissed: without this, Esc
+; destroys the Gui and the next 30ms tick (state=playing, gui="") hits
+; HighlightOnPlaying's recovery rebuild — the panel returns in the same
+; second and the Esc was cosmetic (caught live 2026-09-07). Cleared on
+; every genuine (re)build request (HighlightOnStart new read) and at
+; stop/teardown so the NEXT read always starts clean.
+global gOverlayDismissed := false
 ; Drag offsets for the manual overlay drag (OverlayDragHandler).
 global gDragOffX := 0
 global gDragOffY := 0
@@ -821,11 +829,14 @@ IsMouseOverOverlay() {
 HighlightOnStart(raw) {
     global HighlightWords, HighlightTotalMs, HighlightPlayStart
     global HighlightGui, HighlightCurrentIdx, HighlightFullText
-    global gSeekInFlight
+    global gSeekInFlight, gOverlayDismissed
     ; The new speak's start packet arrived — terminal-state suppression
     ; (gSeekInFlight) is no longer needed; from here the daemon's states
     ; are genuine again.
     gSeekInFlight := false
+    ; A fresh read (or replay/seek) re-opens the panel by explicit user
+    ; action: any prior Esc-dismissal no longer applies.
+    gOverlayDismissed := false
     text := JsonGet(raw, "text")
     totalMs := JsonGet(raw, "total_ms")
     HighlightTotalMs := (totalMs != "") ? Round(totalMs) : 0
@@ -850,9 +861,16 @@ HighlightOnStart(raw) {
 
 HighlightOnPlaying(raw) {
     global HighlightWords, HighlightPlayStart, HighlightTotalMs, HighlightGui
-    global HighlightCurrentIdx, HighlightPaused, AppDir
+    global HighlightCurrentIdx, HighlightPaused, AppDir, gOverlayDismissed
     ; Skip updates while paused (Space-pause).
     if (HighlightPaused) {
+        return
+    }
+    ; the user dismissed the panel mid-read with Esc — the voice keeps
+    ; playing (that is the point of Esc), but the tick's missing-Gui
+    ; recovery must NOT rebuild it. Without this gate the panel came back
+    ; within 30ms of the Esc (caught live 2026-09-07).
+    if (gOverlayDismissed) {
         return
     }
     ; On first "playing" state, initialize the overlay from the full payload.
@@ -909,6 +927,10 @@ HighlightOnPlaying(raw) {
 
 HighlightOnStop() {
     global HighlightPaused, HighlightCurrentIdx, HighlightFullText
+    global gOverlayDismissed
+    ; Read ended — the dismiss flag belongs to THIS read only. Clear it so
+    ; the next read (or a click on the replay bar) builds its panel fresh.
+    gOverlayDismissed := false
     DebugLog "OnStop: paused=" . HighlightPaused . " hadText=" . (HighlightFullText != "")
     StopHighlightTimer()
     ; Finished reads leave a small Replay bar instead of nothing: the last
@@ -1236,13 +1258,14 @@ OverlaySpaceKey() {
 ; window until the read ends (HideHighlightOverlay destroys it; the tick
 ; skips recolor for gui="" and the next read rebuilds clean).
 OverlayEscKey() {
-    global HighlightGui, HighlightPaused
+    global HighlightGui, HighlightPaused, gOverlayDismissed
     if (HighlightGui != "") {
         ; A paused read dismissed with Esc: clear the pause flag so the
         ; next Space (no panel visible) can't resume a ghost panel —
         ; OverlayMouseLeaveResume already guards this, but the flag must
         ; not survive into the next read's rebuild state either way.
         HighlightPaused := false
+        gOverlayDismissed := true
         HideReplayBar()
         HideHighlightOverlay()
         DebugLog "Esc dismissed overlay"
