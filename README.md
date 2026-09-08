@@ -28,7 +28,7 @@ ReadAloudTTS ships with several hotkeys so you can pick whichever fits your work
 | Pause / resume reading | `Space` | While the reading panel is visible, with the pointer over it. |
 | Dismiss the reading panel | `Esc` | Hides the panel for this read; speech continues. |
 | Show last transcript | `Ctrl + Alt + T` | Opens the last-read text in a scrollable window (falls back to the clipboard if nothing was read yet). |
-| Move the reading panel | Drag its title area | The panel remembers where you put it. |
+| Move the reading panel | Drag anywhere on the panel (outside the text and the corner grip) | The panel remembers where you put it. |
 | Zoom the reading panel | `Ctrl + wheel` over the panel, or drag its corner grip | 75%–200% scale. Works while reading; the active word re-anchors. |
 | **Speed up** | `Ctrl + *` (`Ctrl+Shift+8`) | 10% faster. Takes effect on the next chunk. |
 | **Speed down** | `Ctrl + /` | 10% slower. Takes effect on the next chunk. |
@@ -128,13 +128,15 @@ powershell -NoProfile -ExecutionPolicy Bypass -File .\uninstall.ps1 -RemoveAppDa
 
 ReadAloudTTS can show a **karaoke reading panel** while it speaks: a compact, always-on-top window that renders the text being read with the current word highlighted in amber. It appears automatically on each read when enabled (tray menu → **Word highlight box: On**), follows the speech word by word, and stays out of your way otherwise.
 
+![The reading panel following a spoken sentence, click-to-seek, and Ctrl+wheel zoom](docs/assets/overlay-demo.gif)
+
 What the panel does:
 
 - **Follows the speech** — the current word highlights and the view page-flips when the highlight marches past the visible lines, so the spoken line is always on screen.
 - **Click any word to read from there** — speech restarts from that word, mid-sentence included. Clicks that land between words snap to the nearest word, so the whole panel is clickable.
 - **Pause / resume with `Space`** — deliberate and visible: the pause indicator plus the frozen amber word show the state. Works only while the pointer is over the panel (or the panel is focused), so typing elsewhere is untouched.
 - **Zoom** — hold `Ctrl` and scroll the mouse wheel over the panel, or drag the corner grip, to scale it from 75% to 200%. The panel grows as one unit — text, spacing, and the status line all scale together — and the active word stays anchored while reading continues.
-- **Move it anywhere** — drag the panel by its top area; the position persists across reads. `Esc` dismisses it for the current read without stopping speech.
+- **Move it anywhere** — drag the panel by its margins (anywhere outside the text and the corner grip); the position persists across reads. `Esc` dismisses it for the current read without stopping speech.
 - **Finished reads stay one click away** — a small **↻ Replay** bar appears for 8 seconds after a read ends; click it to re-read the same text from the start. No re-selecting needed.
 
 The panel is opt-in per install: toggle it with the tray menu's **Word highlight box** item (the choice persists in `config.json` as `highlight_overlay`).

@@ -29,7 +29,7 @@ Once it is showing:
 - **Click any word** to restart speech from that word. Clicks between words snap to the nearest word.
 - **`Space`** pauses and resumes — only while the pointer is over the panel, so typing elsewhere is unaffected.
 - **`Ctrl + mouse wheel`** over the panel, or **dragging the corner grip**, zooms it between 75% and 200%. Reading continues; the highlighted word stays anchored.
-- **Drag the panel** by its top area to move it anywhere — the position is remembered.
+- **Drag the panel** by its margins (anywhere outside the text and the corner grip) to move it — the position is remembered.
 - **`Esc`** dismisses the panel for the current read; speech continues.
 
 When a read finishes, a small **↻ Replay** bar appears for 8 seconds — click it to re-read the same text from the start.
