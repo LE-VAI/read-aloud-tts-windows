@@ -40,27 +40,23 @@ global gSeekInFlight := false
 global gOverlayReducedMotion := false
 global TranscriptGui := ""
 global ReplayGui := ""
-; Last cursor position — used by HighlightTick to require mouse MOVEMENT
-; before hover-pause (prevents pause/resume flapping when the overlay
-; rebuilds under a resting cursor).
-global gLastMouseX := 0
-global gLastMouseY := 0
 ; --- Overlay stability state (research-driven hardening 2026-09-07) ---
 ; Gate ALL Edit writes on state change: EM_SETSEL every 30ms starves
 ; WM_PAINT (the freeze/flicker root cause). Track the last applied
 ; selection so a tick with an unchanged word touches nothing.
 global gLastSelStart := -1
 global gLastSelEnd := -1
-; Hover state machine: movement-gated with hysteresis + debounce. A
-; resting cursor NEVER toggles pause; enter needs +10px margin, leave
-; fires only after HOVER_LEAVE_DEBOUNCE_MS outside.
-global gHoverInside := false
-global gHoverLeftAt := 0
-global gHoverPauseRequested := false
-global gHoverResumeRequested := false
-global gLastActionAt := 0
+; Pause-indicator status text ("⏸ paused — Space resumes" / "Space pauses").
+; Space is the ONLY pause path now — hover-pause was removed 2026-09-07
+; (user: more frustrating than helpful).
+global OverlayStatusCtrl := ""
 ; DPI scale for overlay geometry (per-monitor: read at build time).
 global gOverlayDpi := 96
+; Session memory of the user's dragged panel position: rebuilds reuse
+; the last dragged spot instead of snapping to bottom-center every read.
+; -1,-1 = never dragged (use default position).
+global gOverlayDraggedX := -1
+global gOverlayDraggedY := -1
 ; Drag offsets for the manual overlay drag (OverlayDragHandler).
 global gDragOffX := 0
 global gDragOffY := 0
@@ -94,13 +90,18 @@ $*^RButton::ReadSelection()
 $*^RButton Up::SuppressCtrlRightClick()
 $*Home::ReadSelection()
 $*F6::StopSpeech()
+; Esc dismisses a visible overlay panel (speech keeps playing — it's a
+; "get this off my screen" gesture, not a stop; F6 stays the stop key).
+; No overlay = plain Esc passes through untouched.
+$*Esc::OverlayEscKey()
 
 $*^!t::ShowTranscript()
 
-; Space = play/pause for the reading overlay (design contract #14: hover
-; is a convenience, never the only control path — WCAG 1.4.13). Toggles
-; pause while the overlay is reading; resumes when paused. Bound only
-; when the overlay exists so normal Space typing elsewhere is untouched.
+; Space = play/pause for the reading overlay (design contract #14:
+; keyboard control, never pointer-only — WCAG 1.4.13). The ONLY pause
+; trigger now; toggles pause while the overlay is reading, resumes when
+; paused. Gated on the overlay context (pointer inside the panel or the
+; panel focused) so normal Space typing elsewhere is untouched.
 $*Space::OverlaySpaceKey()
 
 ; Speed control — on-the-fly rate adjustment.
@@ -748,65 +749,19 @@ StopHighlightTimer() {
 }
 
 HighlightTick() {
-    global HighlightGui, HighlightPaused, gLastMouseX, gLastMouseY
-    global gHoverInside, gHoverLeftAt, gHoverPauseRequested, gHoverResumeRequested
-    global gLastActionAt, gSeekInFlight
+    global HighlightGui, HighlightPaused, gSeekInFlight
     ; Critical 50: serialize this tick against hotkeys/OnMessage for up to
-    ; 50ms — the 30ms timer, WM_LBUTTONDOWN handler and hover logic all
-    ; mutate shared state and AHK preempts a timer thread by default
-    ; (mid-tick interruption corrupted pause state; the research packet's
-    ; root-cause #2). No Sleep/blocking calls inside this callback.
+    ; 50ms — the 30ms timer and the WM_LBUTTONDOWN handler both mutate
+    ; shared state and AHK preempts a timer thread by default (mid-tick
+    ; interruption corrupted pause state; the research packet's root-cause
+    ; #2). No Sleep/blocking calls inside this callback.
     Critical 50
-    ; --- Hover state machine (movement-gated, hysteresis, debounce) ---
-    ; A resting cursor never toggles pause. Enter = cursor INSIDE the
-    ; window rect inflated by HOVER_ENTER_MARGIN px AND moving. Leave =
-    ; outside for HOVER_LEAVE_DEBOUNCE_MS. Pause/resume daemon actions
-    ; run through a single debounced actuator below — never inline.
-    if (HighlightGui != "") {
-        MouseGetPos &mx, &my, &winHwnd
-        inside := (winHwnd = HighlightGui.Hwnd)
-        moved := (mx != gLastMouseX or my != gLastMouseY)
-        now := A_TickCount
-        if (HighlightPaused) {
-            if (!inside or (now - gHoverLeftAt > 250)) {
-                gHoverInside := false
-            }
-            if (inside and gHoverLeftAt = 0) {
-                gHoverInside := true
-            }
-            if (!gHoverInside and !gHoverPauseRequested and !gHoverResumeRequested
-                and (now - gLastActionAt > 250)) {
-                gHoverResumeRequested := true   ; actuator resumes below
-            }
-        } else {
-            if (inside and moved and !gHoverPauseRequested and !gHoverResumeRequested
-                and (now - gLastActionAt > 250)) {
-                gHoverPauseRequested := true    ; actuator pauses below
-            }
-            gHoverInside := inside
-            if (!inside) {
-                if (gHoverLeftAt = 0) {
-                    gHoverLeftAt := now
-                }
-            } else {
-                gHoverLeftAt := 0
-            }
-        }
-        gLastMouseX := mx, gLastMouseY := my
-    }
-    ; --- Debounced actuator: the ONLY place the tick touches the daemon ---
-    ; Stopping/resuming the daemon inline in the tick (which fires every
-    ; 30ms during playback) is what made hover "completely break" — a
-    ; stop request per tick flooded the request/response files.
-    if (gHoverPauseRequested) {
-        gHoverPauseRequested := false
-        gLastActionAt := A_TickCount
-        OverlayHoverPause()
-    } else if (gHoverResumeRequested) {
-        gHoverResumeRequested := false
-        gLastActionAt := A_TickCount
-        OverlayMouseLeaveResume()
-    }
+    ; --- Hover-pause REMOVED (user directive 2026-09-07: more
+    ; frustrating than helpful — a drifting cursor silently stopped reads).
+    ; Pause is now Space-only (pointer inside the panel), fully deliberate
+    ; and visible: the pause indicator on the panel plus the amber word
+    ; staying put make the state obvious. The old movement-gated hover
+    ; machine (enter margin, leave debounce, per-tick actuator) is gone.
     if !FileExist(HighlightPath) {
         return
     }
@@ -886,7 +841,7 @@ HighlightOnStart(raw) {
 HighlightOnPlaying(raw) {
     global HighlightWords, HighlightPlayStart, HighlightTotalMs, HighlightGui
     global HighlightCurrentIdx, HighlightPaused, AppDir
-    ; Skip updates while paused (hover-pause).
+    ; Skip updates while paused (Space-pause).
     if (HighlightPaused) {
         return
     }
@@ -974,6 +929,19 @@ ShowReplayBar() {
     ReplayGui.Move(A_ScreenWidth - barW - 24, A_ScreenHeight - barH - 24, barW, barH)
     ReplayGui.Show("NA")
     SetTranslucent(ReplayGui.Hwnd, 230)
+    ; Auto-fade: the replay offer is a convenience, not a squatter — it
+    ; disappears after 8s instead of sitting on the corner all day. A new
+    ; read (ShowReplayBar on the next done) re-offers it; clicking works
+    ; any time inside the window. A NAMED timer target is load-bearing:
+    ; SetTimer replaces a pending named timer, but a fat-arrow creates a
+    ; NEW timer object each call — two reads within 8s would stack fades
+    ; and the older timer would kill the newer bar early.
+    SetTimer ReplayBarFade, -8000
+}
+
+ReplayBarFade() {
+    HideReplayBar()
+    SetTimer ReplayBarFade, 0
 }
 
 HideReplayBar() {
@@ -1026,7 +994,6 @@ ToggleOverlayEnabled() {
 
 ShowHighlightOverlay(text) {
     global HighlightGui, HighlightFullText, gLastSelStart, gLastSelEnd, gOverlayDpi
-    global gHoverInside, gHoverLeftAt, gHoverPauseRequested, gHoverResumeRequested
     global HighlightPaused, HighlightCurrentIdx, HighlightLastColored, gOverlayReducedMotion
     DebugLog "ShowHighlightOverlay entry: textLen=" . StrLen(text)
     try {
@@ -1046,29 +1013,24 @@ ShowHighlightOverlay(text) {
 
 ShowHighlightOverlayInner(text) {
     global HighlightGui, HighlightFullText, gLastSelStart, gLastSelEnd, gOverlayDpi
-    global gHoverInside, gHoverLeftAt, gHoverPauseRequested, gHoverResumeRequested
     global HighlightPaused, HighlightCurrentIdx, HighlightLastColored, gOverlayReducedMotion
+    global OverlayStatusCtrl, gOverlayDraggedX, gOverlayDraggedY
     HideReplayBar()   ; a new read supersedes the finished-read replay bar
     HideHighlightOverlay()
     HighlightFullText := text
-    ; Reset selection/hover state so a rebuilt overlay starts clean (a
-    ; stale gLastSel* would suppress the first highlight; stale hover
-    ; requests would instantly pause a fresh read). Crucially, clear the
-    ; PAUSE state and word index too: a hover-pause left them set from the
-    ; PREVIOUS read, and the first hover-resume then seeked into the new
-    ; text mid-paragraph (stale HighlightCurrentIdx against fresh words).
+    ; Reset per-read state so a rebuilt overlay starts clean (a stale
+    ; gLastSel* would suppress the first highlight; a stale PAUSE flag +
+    ; word index from the previous read made the first resume seek into
+    ; the new text mid-paragraph — stale HighlightCurrentIdx against
+    ; fresh words).
     HighlightPaused := false
     HighlightCurrentIdx := -1
     HighlightLastColored := -1
     gLastSelStart := -1
     gLastSelEnd := -1
-    gHoverInside := false
-    gHoverLeftAt := 0
-    gHoverPauseRequested := false
-    gHoverResumeRequested := false
     ; +E0x08000000 = WS_EX_NOACTIVATE: window doesn't steal focus when clicked.
     ; Do NOT use +E0x20 (WS_EX_TRANSPARENT) — it makes the window invisible
-    ; to mouse events, which would break hover-pause and click-to-rewind.
+    ; to mouse events, which would break dragging and click-to-rewind.
     HighlightGui := Gui("+AlwaysOnTop -Caption +ToolWindow +E0x08000000")
     HighlightGui.BackColor := "16161D"
     ; DPI-aware geometry: AHK v2 is not per-monitor DPI aware by default;
@@ -1100,6 +1062,17 @@ ShowHighlightOverlayInner(text) {
     panelHeight := Round(108 * dpiScale)
     panelX := Round((screenWidth - panelWidth) / 2)
     panelY := A_ScreenHeight - panelHeight - Round(56 * dpiScale)
+    ; Dragged-position memory: if the user moved the panel, rebuilds
+    ; (every new read) reuse the LAST dragged spot instead of snapping
+    ; back to bottom-center — position amnesia was the top drag complaint.
+    ; Session-only (a global): restart resets to default. Keep the panel
+    ; on-screen — a resolution change between drags could strand it.
+    if (gOverlayDraggedX >= 0 and gOverlayDraggedY >= 0) {
+        if (gOverlayDraggedX + panelWidth <= screenWidth and gOverlayDraggedY + panelHeight <= A_ScreenHeight and gOverlayDraggedX >= 0 and gOverlayDraggedY >= 0) {
+            panelX := gOverlayDraggedX
+            panelY := gOverlayDraggedY
+        }
+    }
     HighlightGui.MarginX := Round(18 * dpiScale)
     HighlightGui.MarginY := Round(14 * dpiScale)
     ; RichEdit50W styles (verified vs MS SDK richedit.h + AHK shipping
@@ -1108,9 +1081,17 @@ ShowHighlightOverlayInner(text) {
     ; the selection stays INVISIBLE by default — the visible signal is
     ; the amber word color, not a selection block. ES_SAVESEL not needed
     ; (we never rely on selection persistence).
-    reStyle := "ClassRichEdit50W +0x50000804 -Tabstop -VScroll w" . (panelWidth - Round(36 * dpiScale)) . " h" . (panelHeight - Round(28 * dpiScale))
+    reStyle := "ClassRichEdit50W +0x50000804 -Tabstop -VScroll w" . (panelWidth - Round(36 * dpiScale)) . " h" . (panelHeight - Round(52 * dpiScale))
     reCtrl := HighlightGui.AddCustom(reStyle)
     DebugLog "  AddCustom ok hwnd=" . reCtrl.Hwnd
+    ; Status line under the text: pause state must be VISIBLE (the old
+    ; hover-pause failed partly because pause was imperceptible). Default
+    ; copy teaches the Space control; on pause it flips to amber
+    ; "⏸ paused — Space resumes". Tiny, dim gray #9A9AA5 on the panel
+    ; BackColor — never competes with the amber word.
+    OverlayStatusCtrl := HighlightGui.Add("Text", "x" . Round(18 * dpiScale) . " w" . (panelWidth - Round(36 * dpiScale)) . " h" . Round(18 * dpiScale) . " c9A9AA5 Background16161D", "  Space pauses · click a word to jump")
+    HighlightGui.SetFont("s8", "Segoe UI Variable Text")
+    OverlayStatusCtrl.SetFont("s8 c9A9AA5")
     ; --- RichEdit init (research gotchas, in order) ---
     reHwnd := reCtrl.Hwnd
     ; EM_SETUNDOLIMIT 0: per-word recoloring creates undo records at 3+/s
@@ -1180,18 +1161,42 @@ MakeCharFormat(mask, effects, yHeightTwips, bgrColor, faceName) {
     return cf
 }
 
+; Pause the current read. Space is the ONLY pause trigger now — the
+; movement-gated hover machine was removed 2026-09-07 (user: more
+; frustrating than helpful; a drifting cursor silently stopped reads).
 OverlayHoverPause(*) {
     global HighlightPaused, HighlightGui
     if (HighlightGui = "" or HighlightPaused) {
         return
     }
     HighlightPaused := true
-    ; Stop the daemon playback (it will remember nothing — resume re-sends text from current word).
+    SetOverlayStatus(true)
+    ; Stop the daemon playback (resume re-sends text from the current word).
     StopSpeechDaemon()
 }
 
-; Space-key play/pause (keyboard alternative to hover — WCAG 1.4.13 /
-; design contract #14). The overlay is WS_EX_NOACTIVATE, so the user's
+; Pause-state status line on the panel. The pause is Space-only now, so
+; the state must be readable at a glance: paused = amber "⏸ paused" with
+; the resume hint; playing = the dim control hint. Reduced motion does
+; not gate this (it's an instant text swap, no animation).
+SetOverlayStatus(paused) {
+    global OverlayStatusCtrl, HighlightGui
+    if (HighlightGui = "" or OverlayStatusCtrl = "") {
+        return
+    }
+    try {
+        if (paused) {
+            OverlayStatusCtrl.SetFont("s8 cF2C14E")
+            OverlayStatusCtrl.Text := "  ⏸ paused — Space resumes"
+        } else {
+            OverlayStatusCtrl.SetFont("s8 c9A9AA5")
+            OverlayStatusCtrl.Text := "  Space pauses · click a word to jump"
+        }
+    }
+}
+
+; Space-key play/pause (the ONLY pause path — hover-pause removed
+; 2026-09-07, user directive). The overlay is WS_EX_NOACTIVATE, so the
 ; real focus stays wherever it was — meaning a blind "no overlay →
 ; passthrough / overlay → toggle" split is WRONG: with the overlay up
 ; during a long read, Space typed into ANY other window (chat, editor,
@@ -1213,6 +1218,29 @@ OverlaySpaceKey() {
     Send "{Space}"
 }
 
+; Esc on a visible panel = dismiss the panel, keep the voice. The tick
+; keeps polling highlight_state, so dismissing here must also stop the
+; terminal-state machinery from resurrecting the panel on the NEXT read's
+; start — no: a new read rebuilds the panel by design (fresh text), and
+; a mid-read Esc keeps the amber state coherent by simply hiding the
+; window until the read ends (HideHighlightOverlay destroys it; the tick
+; skips recolor for gui="" and the next read rebuilds clean).
+OverlayEscKey() {
+    global HighlightGui, HighlightPaused
+    if (HighlightGui != "") {
+        ; A paused read dismissed with Esc: clear the pause flag so the
+        ; next Space (no panel visible) can't resume a ghost panel —
+        ; OverlayMouseLeaveResume already guards this, but the flag must
+        ; not survive into the next read's rebuild state either way.
+        HighlightPaused := false
+        HideReplayBar()
+        HideHighlightOverlay()
+        DebugLog "Esc dismissed overlay"
+        return
+    }
+    Send "{Esc}"
+}
+
 OverlayMouseLeaveResume(*) {
     global HighlightPaused, HighlightCurrentIdx, HighlightFullText, HighlightGui
     if (!HighlightPaused) {
@@ -1227,6 +1255,7 @@ OverlayMouseLeaveResume(*) {
         return
     }
     HighlightPaused := false
+    SetOverlayStatus(false)
     ; Guard against a stale index: HighlightCurrentIdx was reset to -1 on
     ; the previous read's teardown, and ShowHighlightOverlay resets it for
     ; every new read. Only resume when we actually have a word position
@@ -1303,6 +1332,7 @@ OverlayDragHandler(wParam, lParam, msg, hwnd) {
 
 DragTrackOverlay() {
     global HighlightGui, gDragOffX, gDragOffY, gDragMoved, gDragStartX, gDragStartY
+    global gOverlayDraggedX, gOverlayDraggedY
     if (HighlightGui = "") {
         SetTimer DragTrackOverlay, 0
         gDragMoved := false
@@ -1310,6 +1340,14 @@ DragTrackOverlay() {
     }
     if !GetKeyState("LButton", "P") {
         SetTimer DragTrackOverlay, 0
+        ; Persist the dragged position for the next rebuild: a drag is an
+        ; explicit placement — later reads must NOT snap back to default.
+        if (gDragMoved) {
+            WinGetPos &px, &py,,, "ahk_id " . HighlightGui.Hwnd
+            gOverlayDraggedX := px
+            gOverlayDraggedY := py
+            DebugLog "Drag saved pos=" . px . "," . py
+        }
         gDragMoved := false
         return
     }
