@@ -46,6 +46,8 @@ global ReplayGui := ""
 ; selection so a tick with an unchanged word touches nothing.
 global gLastSelStart := -1
 global gLastSelEnd := -1
+; Last logged tick state — gates the tick DebugLog to transitions only.
+global gLastTickState := ""
 ; Pause-indicator status text ("⏸ paused — Space resumes" / "Space pauses").
 ; Space is the ONLY pause path now — hover-pause was removed 2026-09-07
 ; (user: more frustrating than helpful).
@@ -751,7 +753,7 @@ StopHighlightTimer() {
 }
 
 HighlightTick() {
-    global HighlightGui, HighlightPaused, gSeekInFlight
+    global HighlightGui, HighlightPaused, gSeekInFlight, gLastTickState
     ; Critical 50: serialize this tick against hotkeys/OnMessage for up to
     ; 50ms — the 30ms timer and the WM_LBUTTONDOWN handler both mutate
     ; shared state and AHK preempts a timer thread by default (mid-tick
@@ -778,7 +780,13 @@ HighlightTick() {
     }
     ; Parse the single-line JSON state.
     state := JsonGet(raw, "state")
-    DebugLog "Tick state=" . state . " len=" . StrLen(raw)
+    ; Log state TRANSITIONS only: a per-tick line wrote ~30/s while the
+    ; panel sits idle after "done" (21K lines / 20min, live 2026-09-07).
+    ; First tick after a fresh timer start logs once via the reset below.
+    if (state != gLastTickState) {
+        DebugLog "Tick state=" . state . " len=" . StrLen(raw)
+        gLastTickState := state
+    }
     if (state = "start") {
         HighlightOnStart(raw)
     } else if (state = "playing") {
