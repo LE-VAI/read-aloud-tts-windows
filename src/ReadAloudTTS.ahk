@@ -441,9 +441,11 @@ SuppressCtrlRightClick(*) {
 ReadSelection(*) {
     global PyExe, AppDir, PidPath, TempDir, Q, RequestPath, ResponsePath
 
-    ; Hotkey-fired diagnostic — confirm the hook actually triggers in
-    ; Electron apps (ZCode) where Home is normally eaten by the editor.
-    DebugLog("ReadSelection() fired — host=" . WinGetProcessName("A"))
+    ; NO WinGetProcessName("A") here — it throws "Target window not
+    ; found" when Home fires during a foreground transition (e.g. the
+    ; notepad spawn), and an unguarded throw in a hotkey body pops a
+    ; MODAL ERROR DIALOG that kills every hotkey until dismissed
+    ; (caught live 2026-09-07: the user's hotkeys went dead).
 
     if !FileExist(PyExe) {
         TrayTip "Python environment missing. Run install.ps1.", "ReadAloudTTS"
@@ -1342,11 +1344,16 @@ DragTrackOverlay() {
         SetTimer DragTrackOverlay, 0
         ; Persist the dragged position for the next rebuild: a drag is an
         ; explicit placement — later reads must NOT snap back to default.
+        ; Try-armored: WinGetPos on a dying window throws, and a throw in
+        ; a timer callback pops the same modal error dialog that kills
+        ; every hotkey (see ReadSelection note 2026-09-07).
         if (gDragMoved) {
-            WinGetPos &px, &py,,, "ahk_id " . HighlightGui.Hwnd
-            gOverlayDraggedX := px
-            gOverlayDraggedY := py
-            DebugLog "Drag saved pos=" . px . "," . py
+            try {
+                WinGetPos &px, &py,,, "ahk_id " . HighlightGui.Hwnd
+                gOverlayDraggedX := px
+                gOverlayDraggedY := py
+                DebugLog "Drag saved pos=" . px . "," . py
+            }
         }
         gDragMoved := false
         return
