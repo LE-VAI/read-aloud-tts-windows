@@ -90,7 +90,7 @@ def _default_config() -> dict[str, Any]:
         "first_chunk_chars": 150,
         "sentence_silence": 0.4,
         "inter_chunk_pause": 0.25,
-        "length_scale": 1.2,
+        "length_scale": 0.9,
         "noise_scale": 0.4,
         "noise_w": 0.3,
         "voices": {},

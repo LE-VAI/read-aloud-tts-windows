@@ -166,6 +166,10 @@ OnMessage(0x201, OverlayClickHandler)
 ; handler below. (Losing native dblclick behavior is nothing — this
 ; surface's only click verb is seek.)
 OnMessage(0x203, OverlayDoubleClickSuppress)
+; Context-menu suppression: the RichEdit's native right-click menu offers
+; Select All — the one verb that turns this display-only surface into a
+; blue block. Right-click / Shift+F10 / Menu key all funnel here.
+OnMessage(0x7B, OverlayContextMenuSuppress)
 ; Ctrl+wheel zoom on the overlay (user feature 2026-09-08). Win10/11
 ; posts WM_MOUSEWHEEL directly to the window under the cursor (Raymond Chen
 ; 2016-04-20), so this fires with the pointer over the panel even while
@@ -343,15 +347,7 @@ InitTray() {
 }
 
 GetSpeedLabel() {
-    speed := GetCurrentSpeed()
-    if (speed < 1.0) {
-        mult := 1.0 / speed
-        return Round(mult, 1) . "x faster (Ctrl+*/)"
-    } else if (speed > 1.0) {
-        return Round(speed, 1) . "x slower (Ctrl+*/)"
-    } else {
-        return "Normal (Ctrl+*/)"
-    }
+    return SpeedValueLabel(GetCurrentSpeed()) . " (Ctrl+*/)"
 }
 
 ToggleOverlayFromTray(*) {
@@ -372,13 +368,23 @@ CycleSpeed(*) {
         }
     }
     target := presets[nextIdx > 0 ? nextIdx : 1]
-    ; Send the target speed directly.
-    global RequestPath, ResponsePath
+    ; Send the target speed directly, with the same confirmed-feedback
+    ; path as the hotkeys (panel flash + tray tip).
+    global RequestPath, ResponsePath, LastResponse
     try FileDelete ResponsePath
     FileAppend '{"action":"set_speed","speed":' . target . '}', RequestPath, "UTF-8-RAW"
-    WaitResponse(3)
+    confirmed := target
+    if WaitResponse(3) {
+        if RegExMatch(LastResponse, '"speed"\s*:\s*([\d.]+)', &m) {
+            confirmed := Round(m[1], 2)
+        }
+        FlashOverlaySpeed(confirmed)
+        TrayTip SpeedValueLabel(confirmed), "ReadAloudTTS Speed"
+    } else {
+        FlashOverlaySpeed(-1)
+        TrayTip "Speed not set — daemon unreachable", "ReadAloudTTS Speed", 2
+    }
     InitTray()
-    TrayTip GetSpeedLabel(), "ReadAloudTTS Speed"
 }
 
 RestartDaemon(*) {
@@ -661,36 +667,85 @@ GetCurrentSpeed() {
 }
 
 SendSpeed(speed) {
-    global RequestPath, ResponsePath
+    global RequestPath, ResponsePath, LastResponse
     speed := Max(0.5, Min(2.0, Round(speed, 2)))
     ; Read current speed from config to avoid accumulating rounding drift.
     current := GetCurrentSpeed()
-    ; If the daemon set a runtime override, it also wrote it to config,
-    ; so reading config gives us the live value.
     newSpeed := Max(0.5, Min(2.0, Round(current * speed, 2)))
-    if (newSpeed = current)
-        return  ; No change needed.
+    if (newSpeed = current) {
+        ; No change — confirm the CURRENT speed rather than going silent:
+        ; "did it register?" should always have a visible answer.
+        FlashOverlaySpeed(current, true)
+        TrayTip SpeedValueLabel(current), "ReadAloudTTS Speed"
+        return
+    }
     try FileDelete ResponsePath
     req := '{"action":"set_speed","speed":' . newSpeed . '}'
     FileAppend req, RequestPath, "UTF-8-RAW"
     if WaitResponse(3) {
-        ; Read the daemon's response for a human-friendly label.
-        try {
-            resp := FileRead(ResponsePath, "UTF-8-RAW")
-        } catch {
-            resp := ""
+        ; The daemon is the source of truth — read the CONFIRMED speed
+        ; from its response, not the value we guessed. ("message" holds
+        ; the human label; "speed" is the clamped+rounded value applied.)
+        confirmed := newSpeed
+        if RegExMatch(LastResponse, '"speed"\s*:\s*([\d.]+)', &m) {
+            confirmed := Round(m[1], 2)
+        }
+        FlashOverlaySpeed(confirmed)
+        TrayTip SpeedValueLabel(confirmed), "ReadAloudTTS Speed"
+    } else {
+        ; Daemon didn't answer: say so — a silent hotkey is the exact
+        ; "did that even register?" ambiguity this feedback exists to kill.
+        FlashOverlaySpeed(-1)
+        TrayTip "Speed not set — daemon unreachable", "ReadAloudTTS Speed", 2
+    }
+}
+
+SpeedValueLabel(speed) {
+    if (speed < 1.0) {
+        return Round(1.0 / speed, 1) . "x faster"
+    } else if (speed > 1.0) {
+        return Round(speed, 1) . "x slower"
+    }
+    return "normal speed"
+}
+
+; Flash the CONFIRMED speed on the reading panel's status line for ~1.5s,
+; then restore the normal hint line. The panel is where the user's
+; eyes already are during a read, so speed changes confirm themselves
+; in-place instead of requiring a glance at the tray.
+;   speed >= 0.5  -> "1.1x faster" (amber, the accent = "it registered")
+;   speed = -1    -> "speed not set" (the daemon-unreachable failure)
+; A pause active when the flash ends restores the PAUSED line, not the
+; hint line — SetOverlayStatus(paused) is the single source of truth.
+FlashOverlaySpeed(speed, keepOld := false) {
+    global HighlightGui, OverlayStatusCtrl, HighlightPaused, gOverlayScale
+    if (HighlightGui = "" or OverlayStatusCtrl = "") {
+        return
+    }
+    try {
+        s := Round(8 * gOverlayScale)
+        OverlayStatusCtrl.SetFont("s" . s . " cF2C14E")
+        if (speed = -1) {
+            OverlayStatusCtrl.Text := "  speed not set — daemon unreachable"
+        } else {
+            OverlayStatusCtrl.Text := "  " . SpeedValueLabel(speed)
+        }
+        if (keepOld) {
+            ; no-change path: shorter flash, the value didn't move
+            SetTimer RestoreOverlayStatus, -900
+        } else {
+            SetTimer RestoreOverlayStatus, -1500
         }
     }
-    ; Show a tray tip with the new speed.
-    if (newSpeed < 1.0) {
-        mult := 1.0 / newSpeed
-        label := Round(mult, 1) . "x faster"
-    } else if (newSpeed > 1.0) {
-        label := Round(newSpeed, 1) . "x slower"
-    } else {
-        label := "normal speed"
+}
+
+RestoreOverlayStatus() {
+    global OverlayStatusCtrl, HighlightPaused
+    if (OverlayStatusCtrl = "") {
+        return
     }
-    TrayTip label, "ReadAloudTTS Speed"
+    ; Reuse the canonical status setter so pause state stays coherent.
+    SetOverlayStatus(HighlightPaused)
 }
 
 AdjustSpeed(factor) {
@@ -1437,6 +1492,17 @@ OverlayClickHandler(wParam, lParam, msg, hwnd) {
     if (idx >= 0) {
         SeekFromWord(idx)
     }
+    ; Defense-in-depth against selection residue: even with the swallow
+    ; below keeping the native click handler from planting one, a selection
+    ; that exists from any other path must not survive to be painted blue
+    ; by a stray focus event. Collapse to a zero-width caret at the clicked
+    ; char — same EM_EXSETSEL idiom as ColorWordRange's post-format
+    ; collapse. Max(0,…) guards the -1 EM_CHARFROMPOS failure code; the
+    ; control clamps positions beyond EOT itself.
+    cr := Buffer(8, 0)
+    NumPut("Int", Max(0, charIdx), cr, 0)
+    NumPut("Int", Max(0, charIdx), cr, 4)
+    SendMessage(0x0437, 0, cr.Ptr, ctrlHwnd)
     ; SWALLOW the click: returning an integer keeps WM_LBUTTONDOWN away
     ; from the RichEdit's own window proc. Its native handler is what
     ; planted an insertion-point selection and could SetFocus the child —
@@ -1473,6 +1539,31 @@ OverlayDoubleClickSuppress(wParam, lParam, msg, hwnd) {
         return
     }
     return 1   ; swallow — no native word-select on this surface
+}
+
+; Right-click (and Shift+F10 / the Menu key) land as WM_CONTEXTMENU
+; (0x7B) on the RichEdit, whose native menu offers Select All — the one
+; verb that turns the whole display surface into the blue block the
+; user reported. This panel is display-only: it has no edit verbs,
+; so the menu carries no value here. Swallow it entirely.
+OverlayContextMenuSuppress(wParam, lParam, msg, hwnd) {
+    global HighlightGui
+    if (HighlightGui = "") {
+        return
+    }
+    ctrlHwnd := 0
+    try {
+        ctrl := HighlightGui["RichEdit50W1"]
+        if IsObject(ctrl) {
+            ctrlHwnd := ctrl.Hwnd
+        }
+    } catch {
+        return
+    }
+    if (ctrlHwnd = 0 or hwnd != ctrlHwnd) {
+        return
+    }
+    return 1   ; swallow — no context menu, no Select All, on this surface
 }
 
 ; Ctrl+wheel over the overlay = zoom (user feature 2026-09-08). Win10/11
