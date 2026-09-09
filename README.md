@@ -130,6 +130,10 @@ ReadAloudTTS can show a **karaoke reading panel** while it speaks: a compact, al
 
 ![The reading panel following a spoken sentence, click-to-seek, and Ctrl+wheel zoom](docs/assets/overlay-demo.gif)
 
+A longer capture with the synthesized voice, recorded on a normal desktop — select text, it reads, the panel follows, click a word to jump back:
+
+https://github.com/LE-VAI/read-aloud-tts-windows/raw/main/docs/assets/overlay-demo-with-audio.mp4
+
 What the panel does:
 
 - **Follows the speech** — the current word highlights and the view page-flips when the highlight marches past the visible lines, so the spoken line is always on screen.
