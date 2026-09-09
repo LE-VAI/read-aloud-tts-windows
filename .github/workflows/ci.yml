@@ -20,6 +20,14 @@ jobs:
       - name: Install pytest
         run: pip install pytest
 
+      # Sanitize runs FIRST on the pristine checkout: it scans repo
+      # content, and any build step before it (pytest, py_compile)
+      # leaves __pycache__ artifacts that the artifact-dir rule then
+      # correctly flags — a step-order failure, not a content one.
+      - name: Sanitize check
+        shell: pwsh
+        run: powershell -NoProfile -ExecutionPolicy Bypass -File .\scripts\sanitize-check.ps1
+
       - name: Run unit tests
         run: python -m pytest src/test_speak.py src/test_speak_server.py src/test_overlay_server.py -v
 
@@ -28,10 +36,6 @@ jobs:
           python -m py_compile src/speak.py
           python -m py_compile src/speak_server.py
           python -m py_compile src/overlay_server.py
-
-      - name: Sanitize check
-        shell: pwsh
-        run: powershell -NoProfile -ExecutionPolicy Bypass -File .\scripts\sanitize-check.ps1
 
       - name: Smoke test
         shell: pwsh
