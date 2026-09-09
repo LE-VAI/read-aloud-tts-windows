@@ -2273,15 +2273,37 @@ JsonGet(json, key) {
     if RegExMatch(json, pat . '(-?\d+\.?\d*)', &m) {
         return m[1]
     }
-    ; String values: capture up to the CLOSING quote, skipping escaped
-    ; quotes (\"), then decode the standard JSON escapes. The old
-    ; '"([^"]*)"' pattern stopped at the first quote — text like
-    ; 'He said "wait"' captured as 'He said \' and a later click-to-rewind
-    ; re-spoke the truncated capture (proven round-trip 2026-09-06).
-    if RegExMatch(json, pat . '"((?:[^"\\]|\\.)*)"', &m) {
-        return JsonUnescape(m[1])
+    ; String values: locate the opening quote, then WALK to the closing
+    ; quote honoring backslash escapes — no regex capture for the body.
+    ; The old '"((?:[^"\\]|\\.)*)"' pattern recursed PCRE once per
+    ; character: a long read's highlight JSON (11K+ chars live 2026-09-09)
+    ; blew the recursion limit and threw PCRE error -21 as a modal
+    ; (user screenshot 07:00). A bounded InStr/SubStr walk is linear
+    ; and cannot recurse. Escape semantics preserved: \" never closes the
+    ; string, \\ is a literal backslash (so \\" is backslash + CLOSE).
+    if !RegExMatch(json, pat, &mKey) {
+        return ""
     }
-    return ""
+    open := mKey.Pos + mKey.Len
+    if (SubStr(json, open, 1) != '"') {
+        return ""
+    }
+    i := open + 1
+    len := StrLen(json)
+    while (i <= len) {
+        c := SubStr(json, i, 1)
+        if (c = "\") {
+            i += 2   ; skip the escaped pair — an escaped quote can't close
+        } else if (c = '"') {
+            break    ; real closing quote
+        } else {
+            i++
+        }
+    }
+    if (i > len) {
+        return ""   ; unterminated — treat as absent
+    }
+    return JsonUnescape(SubStr(json, open + 1, i - open - 1))
 }
 
 JsonUnescape(s) {
@@ -2350,32 +2372,57 @@ ParseWordTimings(json) {
     global HighlightWords
     result := []
     text := JsonGet(json, "text")
+    ; Find each word tuple by WALKING the JSON array — the old regex
+    ; '\["((?:[^"\\]|\\.)*)",...' recursed PCRE per character and threw
+    ; -21 on long reads (same failure class as JsonGet's string pattern).
+    ; Walk: find "[" + quote, walk the literal to its closing quote
+    ; (escape-aware), then expect ,number ,number ] right after.
     pos := 1
-    ; Find each word tuple via regex. The word is a JSON string literal and
-    ; may itself contain escaped quotes/tokens (e.g. ["\"wait\"",...]) —
-    ; capture the full literal, then JsonUnescape it. The old '"([^"]+)"'
-    ; pattern dropped such words entirely, which ALSO desynced AHK word
-    ; indexes from the daemon's \S+ token list (click-to-rewind landed on
-    ; the wrong word).
-    pat := '\["((?:[^"\\]|\\.)*)",\s*([\d.]+),\s*([\d.]+)\]'
-    searchFrom := 1
     charSearchPos := 1
-    while RegExMatch(json, pat, &m, searchFrom) {
-        word := JsonUnescape(m[1])
-        startMs := Round(m[2])
-        endMs := Round(m[3])
-        ; Find this word's char offset in the full text (sequential scan).
-        foundPos := InStr(text, word, false, charSearchPos)
-        if (foundPos > 0) {
-            charStart := foundPos - 1  ; 0-based for EM_SETSEL
-            charEnd := foundPos + StrLen(word) - 1
-            result.Push([word, startMs, endMs, charStart, charEnd])
-            charSearchPos := foundPos + StrLen(word)
-        } else {
-            ; Fallback: append with unknown offset.
-            result.Push([word, startMs, endMs, -1, -1])
+    len := StrLen(json)
+    while (pos <= len) {
+        openBracket := InStr(json, '["', false, pos)
+        if (openBracket = 0) {
+            break
         }
-        searchFrom := m.Pos + m.Len
+        litStart := openBracket + 2
+        i := litStart
+        while (i <= len) {
+            c := SubStr(json, i, 1)
+            if (c = "\") {
+                i += 2
+            } else if (c = '"') {
+                break
+            } else {
+                i++
+            }
+        }
+        if (i > len) {
+            break   ; unterminated literal — stop scanning
+        }
+        ; After the closing quote: ,<num>,<num>] = a word tuple.
+        if RegExMatch(json, ',\s*([\d.]+)\s*,\s*([\d.]+)\s*\]', &mNum, i + 1)
+                and mNum.Pos = i + 1 {
+            word := JsonUnescape(SubStr(json, litStart, i - litStart))
+            startMs := Round(mNum[1])
+            endMs := Round(mNum[2])
+            ; Find this word's char offset in the full text (sequential scan).
+            foundPos := InStr(text, word, false, charSearchPos)
+            if (foundPos > 0) {
+                charStart := foundPos - 1  ; 0-based for EM_SETSEL
+                charEnd := foundPos + StrLen(word) - 1
+                result.Push([word, startMs, endMs, charStart, charEnd])
+                charSearchPos := foundPos + StrLen(word)
+            } else {
+                ; Fallback: append with unknown offset.
+                result.Push([word, startMs, endMs, -1, -1])
+            }
+            pos := mNum.Pos + mNum.Len
+        } else {
+            ; Not a word tuple (e.g. a nested array of strings) — move
+            ; past this opening bracket and keep scanning.
+            pos := openBracket + 1
+        }
     }
     return result
 }
