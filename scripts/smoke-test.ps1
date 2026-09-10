@@ -47,6 +47,7 @@ $requiredFiles = @(
     "src\overlay_server.py",
     "src\overlay.html",
     "src\overlay_mock.py",
+    "src\demo_director.py",
     "src\test_speak.py",
     "src\test_speak_server.py",
     "src\test_overlay_server.py",

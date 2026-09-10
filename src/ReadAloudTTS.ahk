@@ -50,10 +50,13 @@ global gLastSelStart := -1
 global gLastSelEnd := -1
 ; Last logged tick state — gates the tick DebugLog to transitions only.
 global gLastTickState := ""
-; Pause-indicator status text ("⏸ paused — Space resumes" / "Space pauses").
-; Space is the ONLY pause path now — hover-pause was removed 2026-09-07
-; (user: more frustrating than helpful).
-global OverlayStatusCtrl := ""
+    ; Pause-indicator status text ("⏸ paused — Space resumes" / "Space pauses").
+    ; Space is the ONLY pause path now — hover-pause was removed 2026-09-07
+    ; (user: more frustrating than helpful).
+    global OverlayStatusCtrl := ""
+    ; Demo-child per-tick report gate (demo studio only).
+    global gLastReportedIdx := -1
+    global gLastReportedGui := -1
 ; DPI scale for overlay geometry (per-monitor: read at build time).
 global gOverlayDpi := 96
 ; Session memory of the user's dragged panel position: rebuilds reuse
@@ -102,6 +105,25 @@ global gDragScaleMoved := false
 ; for the drag-to-scale surface, right next to the "Ctrl+wheel zooms" copy).
 global OverlayGripCtrl := ""
 
+; --- Demo child mode (self-serve demo studio 2026-09-10) -------------------
+; src/demo_director.py launches THIS script with --demo-child inside an
+; isolated sandbox dir, then speaks the REAL daemon file protocol
+; (tmp\highlight_state.json packets + tmp\request.json/response.json) so
+; the real panel build, seek-resume, pause, speed and zoom paths all run
+; for deterministic demo capture. Fail-closed by construction: hotkeys
+; are suspended (below), no daemon is spawned, and the child only ever
+; touches files inside its own AppDir. Production launches never pass
+; --demo-child, so live behavior is byte-for-byte unchanged.
+global gDemoChild := false
+global gDemoParentPid := 0
+loop A_Args.Length {
+    if (A_Args[A_Index] = "--demo-child") {
+        gDemoChild := true
+    } else if (A_Args[A_Index] = "--demo-parent" and A_Index < A_Args.Length) {
+        gDemoParentPid := Integer(A_Args[A_Index + 1])
+    }
+}
+
 DirCreate TempDir
 ; Brand the tray — without this the taskbar shows AutoHotkey's generic icon.
 ; Graceful fallback: missing file just keeps the default icon.
@@ -109,6 +131,16 @@ if FileExist(AppDir . "\app.ico") {
     TraySetIcon(AppDir . "\app.ico")
 }
 A_IconTip := "ReadAloudTTS — select text, press Home"
+
+; Demo child: arm the demo runner BEFORE hotkeys register (the first
+; hotkey definition ends the auto-execute section, so any gate placed
+; below it never runs). Demo children skip the tray, daemon spawn and
+; prune cycle entirely — the Python director is their only producer, so
+; a demo child can never speak audio or touch the live daemon.
+if gDemoChild {
+    DemoChildRun()
+}
+
 ; Don't blindly delete the readiness marker — if a daemon from a previous
 ; session is still alive (holding the single-instance mutex), deleting the
 ; marker orphans it and every subsequent Home press silently fails. Ping
@@ -157,6 +189,14 @@ $*^+8::AdjustSpeed(0.9)
 $*^/::AdjustSpeed(1.1)
 $*^0::ResetSpeed()
 
+; Demo child fail-closed: suspend every hotkey above. The demo child
+; must never steal a keystroke from the user while the demo runs
+; (Home/F6/Space/Esc/speed nudges all pass straight through to the
+; real apps — the director drives this process by file, not keyboard).
+if gDemoChild {
+    Suspend 1
+}
+
 ; Click-to-rewind on the highlight overlay: register the WM_LBUTTONDOWN
 ; monitor ONCE here. Previously it was registered inside every
 ; ShowHighlightOverlay() build, stacking duplicate message handlers.
@@ -189,7 +229,11 @@ OnMessage(0x7B, OverlayContextMenuSuppress)
 ; bare wheel over the panel stays native so any scroll instinct still works.
 OnMessage(0x020A, OverlayWheelZoomHandler)
 
-StartDaemon()
+; Demo children never spawn a daemon: the Python director IS their
+; daemon (it writes the same files the real one writes, with zero audio).
+if !gDemoChild {
+    StartDaemon()
+}
 
 ; ---------------------------------------------------------------------------
 ; Daemon management
@@ -1066,6 +1110,7 @@ HighlightOnPlaying(raw) {
         HighlightCurrentIdx := idx
         SelectOverlayWord(idx)
     }
+    DemoTickReport()
 }
 
 HighlightOnStop() {
@@ -1375,6 +1420,12 @@ ShowHighlightOverlayInner(text) {
     ; worst-case, unlike the old 220) while keeping a subtle blend.
     SetTranslucent(hwnd, 243)
     DebugLog "  ShowHighlightOverlay BUILD COMPLETE"
+    ; Demo child: report the build the moment it lands. A bare "start"
+    ; packet carries no ms field, so the tick returns before its report
+    ; hook — without this the director never sees the rebuilt panel.
+    if (gDemoChild) {
+        DemoTickReport()
+    }
 }
 
 ; Build a zero-initialized CHARFORMAT2W (116 bytes, pack(4) — offsets
@@ -2623,6 +2674,204 @@ ExitFunc(*) {
     HideReplayBar()
     HideHighlightOverlay()
     CloseTranscript()
-    StopDaemon()
+    if !gDemoChild {
+        StopDaemon()
+    }
     ExitApp
+}
+
+; ---------------------------------------------------------------------------
+; Demo child mode (src/demo_director.py)
+; ---------------------------------------------------------------------------
+; The demo studio launches THIS script with --demo-child in an isolated
+; sandbox dir. The director then plays daemon: it writes the real wire
+; files (tmp\highlight_state.json packets, tmp\request.json for set_speed
+; seeks... wait — the director never writes request.json; it answers the
+; panel's own request.json writes by dropping response.json) and the
+; panel's genuine tick/pause/seek/speed/zoom code paths run untouched.
+;
+; Directives (tmp\demo_directives.json, polled 60ms):
+;   {"action":"exit"}                        — clean shutdown
+;   {"action":"exit_now"}                    — immediate ExitApp (kill path)
+;   {"action":"scale","scale":1.6}           — set panel zoom
+;   {"action":"pause"} / {"action":"resume"} — Space-equivalent pause
+;   {"action":"flash_speed","speed":0.8}     — drive FlashOverlaySpeed
+;   {"action":"speed_set","speed":0.8}       — full SendSpeed path
+;                                              (request.json -> confirmed)
+;   {"action":"panel_info"}                  — report panel.json snapshot
+;
+; The reporter (tmp\panel.json, written on every panel state change) is
+; the director's eyes: panel rect, hwnd, RichEdit metrics, scroll state,
+; current word, pause/scale state. Without it the director is blind.
+; ---------------------------------------------------------------------------
+
+DemoChildRun() {
+    global AppDir, TempDir, gDemoParentPid, ShowOverlayEnabled
+    dir := TempDir . "\demo"
+    DirCreate dir
+    ; Exit fast when the parent (Python director) dies mid-run — orphaned
+    ; demo children would linger as invisible GUI processes. Poll every
+    ; second; parent death is a hard stop, not a graceful one.
+    if (gDemoParentPid > 0) {
+        SetTimer DemoParentWatchdog, 2000
+    }
+    SetTimer DemoDirectivePoll, 30
+    ; The demo child has no tray and no Home hotkey — the director IS the
+    ; read trigger. The panel lane always runs with the overlay on: the
+    ; 30ms highlight tick polls tmp\highlight_state.json for the mock
+    ; daemon's packets, exactly like a live read.
+    StartHighlightTimer()
+    DemoChildReport("child_started")
+}
+
+DemoParentWatchdog() {
+    global gDemoParentPid
+    if !ProcessExist(gDemoParentPid) {
+        ExitApp
+    }
+}
+
+DemoDirectivePoll() {
+    global TempDir
+    static lastRaw := ""
+    path := TempDir . "\demo_directives.json"
+    raw := ""
+    try raw := FileRead(path, "UTF-8-RAW")
+    if (raw = "") {
+        return
+    }
+    raw := Trim(raw)
+    if (raw = lastRaw) {
+        return
+    }
+    lastRaw := raw
+    DemoHandleDirective(raw)
+}
+
+DemoHandleDirective(raw) {
+    global TempDir, HighlightPaused, gOverlayScale
+    ; One directive per file write; JSON body via the shared JsonGet.
+    action := JsonGet(raw, "action")
+    switch action {
+        case "exit":
+            ExitApp
+        case "exit_now":
+            ExitApp
+        case "scale":
+            s := JsonGet(raw, "scale")
+            if (s != "") {
+                ApplyOverlayScale(Float(s))
+            }
+            DemoChildReport("scale")
+        case "pause":
+            if (HighlightGui != "" and !HighlightPaused) {
+                OverlayHoverPause()
+            }
+            DemoChildReport("pause")
+        case "resume":
+            if (HighlightPaused) {
+                OverlayMouseLeaveResume()
+            }
+            DemoChildReport("resume")
+        case "flash_speed":
+            sp := JsonGet(raw, "speed")
+            if (sp != "") {
+                FlashOverlaySpeed(Float(sp))
+            }
+            DemoChildReport("flash_speed")
+        case "speed_set":
+            ; Full SendSpeed path: writes request.json like the real
+            ; hotkey, waits for the director's response.json, reads the
+            ; CONFIRMED speed from it — the genuine confirmed-feedback
+            ; loop, exercised end to end on camera.
+            sp := JsonGet(raw, "speed")
+            if (sp != "") {
+                SendSpeed(Float(sp))
+            }
+            DemoChildReport("speed_set")
+        case "panel_info":
+            DemoChildReport("panel_info")
+        case "replay":
+            ; The replay-bar click path: SeekFromWord restarts the
+            ; highlight timer (HighlightOnStop stopped it on done) and
+            ; arms gSeekInFlight — the genuine replay gesture without
+            ; touching request.json or audio.
+            SeekFromWord(0)
+            DemoChildReport("replay")
+        default:
+            ; Unknown directive: ignore silently (the director may write
+            ; a directive the child predates).
+    }
+}
+
+; Demo child reporter: panel geometry + RichEdit metrics + playback state,
+; as JSON. Written on every directive and on every tick word change —
+; the director waits on these values between camera moves. Written
+; atomically enough for a poller: single FileAppend to a fresh file
+; (delete-then-append, the same idiom the request/response files use).
+DemoChildReport(reason) {
+    global HighlightGui, HighlightWords, HighlightCurrentIdx, HighlightPaused
+    global gOverlayScale, gOverlayDpi, gLastSelStart, gLastSelEnd, TempDir
+    path := TempDir . "\panel.json"
+    try FileDelete path
+    hwnd := (HighlightGui != "") ? HighlightGui.Hwnd : 0
+    x := 0, y := 0, w := 0, h := 0
+    if (hwnd) {
+        WinGetPos &x, &y, &w, &h, "ahk_id " . hwnd
+    }
+    reH := 0
+    reW := 0
+    charIdx := -1
+    visLineCount := 0
+    firstVisLine := -1
+    if (hwnd) {
+        try {
+            reCtrl := HighlightGui["RichEdit50W1"]
+            ControlGetPos &cx, &cy, &cw, &ch, , "ahk_id " . reCtrl.Hwnd
+            reW := cw
+            reH := ch
+            ; First visible line + total client lines via EM_GETFIRSTVISIBLELINE
+            ; and EM_POSFROMCHAR on the line after the last — the director
+            ; reads scroll state from this without touching the control.
+            firstVisLine := SendMessage(0x00CE, 0, 0, reCtrl.Hwnd)  ; EM_GETFIRSTVISIBLELINE
+            charIdx := HighlightWords.Length > 0 && HighlightCurrentIdx >= 0
+                ? HighlightWords[HighlightCurrentIdx + 1][4] : -1
+            ; visible line count = EM_GETLINECOUNT while the control wraps
+            total := SendMessage(0x00BA, 0, 0, reCtrl.Hwnd)  ; EM_GETLINECOUNT
+            visLineCount := total
+        } catch {
+        }
+    }
+    out := '{"reason":"' . reason . '"'
+    out .= ',"gui":' . (hwnd ? 1 : 0)
+    out .= ',"hwnd":' . hwnd
+    out .= ',"x":' . x . ',"y":' . y . ',"w":' . w . ',"h":' . h
+    out .= ',"re_w":' . reW . ',"re_h":' . reH
+    out .= ',"first_vis_line":' . firstVisLine
+    out .= ',"line_count":' . visLineCount
+    out .= ',"words":' . HighlightWords.Length
+    out .= ',"cur_idx":' . HighlightCurrentIdx
+    out .= ',"char_idx":' . charIdx
+    out .= ',"paused":' . (HighlightPaused ? "true" : "false")
+    out .= ',"scale":' . Format("{:.2f}", gOverlayScale)
+    out .= ',"dpi":' . gOverlayDpi
+    out .= ',"sel_start":' . gLastSelStart . ',"sel_end":' . gLastSelEnd
+    out .= '}'
+    FileAppend out, path, "UTF-8-RAW"
+}
+
+; Demo tick hook: the 30ms highlight tick already owns the word-change
+; moment — piggyback the reporter there so the director sees the amber
+; word's real timing without a second timer. Also reports on GUI LIFECYCLE
+; changes (built/destroyed/rebuilt): a rebuild after done produces the
+; same cur_idx as before, and a change-gate on words alone would leave
+; the director staring at a stale dead-hwnd report forever.
+DemoTickReport() {
+    global HighlightGui, HighlightCurrentIdx, gLastReportedIdx, gLastReportedGui
+    guiAlive := (HighlightGui != "") ? 1 : 0
+    if (HighlightCurrentIdx != gLastReportedIdx or guiAlive != gLastReportedGui) {
+        gLastReportedIdx := HighlightCurrentIdx
+        gLastReportedGui := guiAlive
+        DemoChildReport("tick")
+    }
 }
