@@ -145,11 +145,17 @@ $*Space::OverlaySpaceKey()
 ; Speed control — on-the-fly rate adjustment.
 ;   Ctrl + * (Ctrl+Shift+8) = faster  (multiply = more speed)
 ;   Ctrl + /                = slower  (divide = less speed)
+;   Ctrl + 0                = reset to normal speed (1.0) — the keyboard
+;      complement of the nudge pair; ResetSpeed routes through SendSpeed
+;      so the panel flash + tray tip carry the DAEMON-CONFIRMED value
+;      (the old dead-code version wrote a bare request and read config,
+;      which can be stale against the runtime override).
 ; Tray menu "Speed:" item cycles presets and resets to normal.
 ; Takes effect on the next chunk being synthesized, not the currently
 ; playing one. Persists to config.json so it survives restarts.
 $*^+8::AdjustSpeed(0.9)
 $*^/::AdjustSpeed(1.1)
+$*^0::ResetSpeed()
 
 ; Click-to-rewind on the highlight overlay: register the WM_LBUTTONDOWN
 ; monitor ONCE here. Previously it was registered inside every
@@ -758,16 +764,18 @@ AdjustSpeed(factor) {
 }
 
 ResetSpeed() {
-    global RequestPath, ResponsePath
+    ; Ctrl+0: back to normal speed. Implemented as the exact inverse
+    ; nudge (1.0/current) so it rides the SAME confirmed-feedback path
+    ; as Ctrl+* and Ctrl+/ — daemon-confirmed flash + tray tip, and the
+    ; natural no-op when already at 1.0 (SendSpeed's no-change branch
+    ; flashes "normal speed" instead of a silent hotkey). The old
+    ; dead-code version wrote a bare request with no visible feedback
+    ; and its "already normal" gate read stale config, not the daemon.
     current := GetCurrentSpeed()
-    if (current = 1.0) {
-        TrayTip "Already normal speed", "ReadAloudTTS Speed"
-        return
+    if (current > 0) {
+        SendSpeed(1.0 / current)
     }
-    try FileDelete ResponsePath
-    FileAppend '{"action":"set_speed","speed":1.0}', RequestPath, "UTF-8-RAW"
-    WaitResponse(3)
-    TrayTip "Normal speed", "ReadAloudTTS Speed"
+    InitTray()
 }
 
 global gDebugLogWrites := 0

@@ -241,6 +241,45 @@ def test_set_speed_labels():
             _restore_speed_env(saved)
 
 
+def test_reset_speed_inverse_nudge_reaches_normal():
+    """Ctrl+0 semantics: AHK ResetSpeed sends current * (1.0/current).
+
+    The daemon's set_speed is ABSOLUTE — the AHK multiplies client-side
+    (SendSpeed: newSpeed = Round(current * factor, 2)) and sends the flat
+    target. Simulate that exact wire computation for each speed a user
+    can nudge to (0.8 favorite, clamps, odd nudges): the AHK-side product
+    must land on exactly 1.0 after its 2dp round, and the daemon must
+    round-trip that to speed 1.0 on disk.
+    """
+    from pathlib import Path
+    import tempfile
+
+    starts = [0.8, 0.5, 2.0, 0.91, 1.1]
+    with tempfile.TemporaryDirectory() as td:
+        saved = _speed_test_env(Path(td))
+        try:
+            speak, speak_server, cfg_path = saved
+            for start in starts:
+                speak_server.handle_set_speed(start)
+                # AHK SendSpeed math: newSpeed = Round(current * factor, 2)
+                # with factor = 1.0 / current (the ResetSpeed inverse nudge).
+                current = speak_server.load_config()["length_scale"]
+                wire = round(current * (1.0 / current), 2)
+                assert wire == 1.0, (
+                    f"AHK reset math from {start}: current={current} wire={wire}"
+                )
+                result = speak_server.handle_set_speed(wire)
+                assert result["speed"] == 1.0, (
+                    f"reset from {start} via {wire} -> {result['speed']}"
+                )
+                on_disk = speak_server.load_config()
+                assert on_disk["length_scale"] == 1.0, (
+                    f"reset from {start} must persist 1.0, got {on_disk['length_scale']}"
+                )
+        finally:
+            _restore_speed_env(saved)
+
+
 # ---------------------------------------------------------------------------
 # Runner for manual execution (python src/test_speak_server.py)
 # ---------------------------------------------------------------------------
