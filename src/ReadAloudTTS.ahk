@@ -64,13 +64,16 @@ global gOverlayDraggedY := -1
 ; UI zoom scale for the overlay (user-requested drag-to-scale + Ctrl+wheel
 ; 2026-09-08). ONE multiplier composes with the DPI scale everywhere the panel
 ; is built: width/height/margins/font twips all derive from uiScale =
-; dpiScale * gOverlayScale, so a zoom keeps the panel's proportions (the
-; "dynamic & responsive resizing" ask). Clamp 0.75..2.0: below 0.75 the
-; status line would shrink below legibility; above 2.0 the panel outgrows a
-; 1080p work area. Session-only like dragged-position (a restart resets to
-; 1.0 — deliberate: this is a readability aid for the current sitting, not a
-; persistent preference) and every rebuild re-applies it, so a mid-read zoom
-; survives the panel rebuilds that follow seeks/restarts.
+; dpiScale * gOverlayScale. Since 2026-09-10 zoom also grows the VISIBLE LINE
+; COUNT (OverlayLineCount: 2 lines at 1.0 → 5 at ~1.9) — the old lockstep
+; font+box scaling froze the panel at 2 lines at every zoom, so zooming up
+; bought bigger text but never more reading context. Clamp 0.75..2.0: below
+; 0.75 the status line would shrink below legibility; at 2.0 the 5-line
+; panel is ~384px, inside a 1080p work area. Session-only like dragged-
+; position (a restart resets to 1.0 — deliberate: this is a readability aid
+; for the current sitting, not a persistent preference) and every rebuild
+; re-applies it, so a mid-read zoom survives the panel rebuilds that follow
+; seeks/restarts.
 global gOverlayScale := 1.0
 ; Per-read "Esc dismissed the panel" flag. The tick's playing stream must
 ; NOT resurrect a panel the user just dismissed: without this, Esc
@@ -1175,6 +1178,36 @@ ShowHighlightOverlay(text) {
     }
 }
 
+; OverlayLineCount(zoom): visible body lines the panel shows at a given
+; zoom. Zoom used to scale font and box in lockstep, freezing the panel at
+; 2 lines no matter the zoom — a bigger font bought no more reading context
+; (user call 2026-09-10: "no matter how much you zoom"). Now the panel
+; HEIGHT outgrows the font: 1.0 stays the validated 2-line baseline; the
+; count steps up as the font grows (1.3 → 3 lines, 1.6 → 4, 1.9 → 5) so
+; larger type arrives with MORE context, not less. Line-height stays
+; ~1.5em and text never clips (WCAG 1.4.4's 200%-no-loss principle).
+OverlayLineCount(zoom) {
+    if (zoom < 1.15) {
+        return 2
+    }
+    if (zoom < 1.45) {
+        return 3
+    }
+    if (zoom < 1.75) {
+        return 4
+    }
+    return 5
+}
+
+; OverlayPanelHeight(lineCount, uiScale): total panel px for a line count.
+; Single source of truth used by the build path AND the zoom-resize path
+; (two 108*uiScale derivations drifting apart was the bug class to avoid).
+; 108 = 2-line baseline (14 top margin + 2x28 text + 14 gap + 18 status +
+; 6 pad, at 96dpi); each extra body line adds its 28px pitch (scaled).
+OverlayPanelHeight(lineCount, uiScale) {
+    return Round((108 + 28 * (lineCount - 2)) * uiScale)
+}
+
 ShowHighlightOverlayInner(text) {
     global HighlightGui, HighlightFullText, gLastSelStart, gLastSelEnd, gOverlayDpi
     global HighlightPaused, HighlightCurrentIdx, HighlightLastColored, gOverlayReducedMotion
@@ -1234,7 +1267,7 @@ ShowHighlightOverlayInner(text) {
     if (panelWidth > maxW) {
         panelWidth := maxW
     }
-    panelHeight := Round(108 * uiScale)
+    panelHeight := OverlayPanelHeight(OverlayLineCount(gOverlayScale), uiScale)
     panelX := Round((screenWidth - panelWidth) / 2)
     panelY := A_ScreenHeight - panelHeight - Round(56 * dpiScale)
     ; Dragged-position memory: if the user moved the panel, rebuilds
@@ -1311,6 +1344,12 @@ ShowHighlightOverlayInner(text) {
     ; panel build; caught live 2026-09-07 after 693 failed rebuilds).
     HighlightGui.Show("x" . panelX . " y" . panelY . " w" . panelWidth . " h" . panelHeight . " NA")
     DebugLog "  Gui.Show ok x=" . panelX . " y=" . panelY . " w=" . panelWidth . " h=" . panelHeight . " hwnd=" . HighlightGui.Hwnd
+    ; Line-fit self-correction: the height formula assumed pitch scales
+    ; linearly with zoom; RichEdit rounds line boxes UP, so at 3+ lines
+    ; the built panel can come up a few px short (probe: 46px pitch at
+    ; 1.6x vs 44.8 formula → 4th line clipped). Measure real pitch and
+    ; grow — must run AFTER Show (client geometry is real only then).
+    try EnsureOverlayLineFit(reHwnd, OverlayLineCount(gOverlayScale))
     ; Windows 11 polish via DWM (research packet area 3). All wrapped in
     ; try — attribute 33/38 need Win11; failure falls back to square/dark.
     hwnd := HighlightGui.Hwnd
@@ -1815,7 +1854,7 @@ ApplyOverlayScale(newScale) {
     if (panelWidth > maxW) {
         panelWidth := maxW
     }
-    panelHeight := Round(108 * uiScale)
+    panelHeight := OverlayPanelHeight(OverlayLineCount(gOverlayScale), uiScale)
     try {
         ; Top-left anchored: the grip corner tracks the pointer; for wheel
         ; zoom keep the top-left too (the status line stays under the same
@@ -1885,6 +1924,10 @@ ApplyOverlayScale(newScale) {
             ; Line pitch depends on font size: ScrollWordIntoView measures
             ; it live every call, so the re-anchor above already used the
             ; post-reflow pitch. No cached pitch to fix.
+            ; Zoom line-fit self-correction: reflow changes the real pitch
+            ; — measure and grow if the intended line count no longer fits
+            ; (same rounding guard as the build path).
+            EnsureOverlayLineFit(reHwnd, OverlayLineCount(gOverlayScale))
         }
         SetOverlayStatus(HighlightPaused)
     } catch as e {
@@ -2123,14 +2166,20 @@ SelectOverlayWord(idx) {
 
 ScrollWordIntoView(reHwnd, charIdx) {
     ; Visible-band math from three EM_POSFROMCHAR probes (0x426):
-    ; line pitch 28px, client height 56px = exactly 2 display lines, and
-    ; the return packs x=LOWORD/y=HIWORD — a signed read (pos >> 16)
-    ; keeps negative y (word above the viewport) intact. y<0 → above the
-    ; band; y+pitch>clientH → below. Both page-flip so the word's line
-    ; becomes the TOP visible line; a mid-line word stays put (already
-    ; visible). EM_SETSCROLLPOS takes a POINT in CLIENT coordinates:
-    ; probe5 showed y=56 → FIRSTVISIBLE=2 and y=100000 clamps to the
-    ; doc max, so it accepts any target and clamps — no manual clamp.
+    ; line pitch 28px at the 2-line baseline, and the return packs
+    ; x=LOWORD/y=HIWORD — a signed read (pos >> 16) keeps negative y
+    ; (word above the viewport) intact. Anchoring matured 2026-09-10:
+    ; the original page-flip pinned the amber word's line as the TOP
+    ; line, which on a 2-line panel teleported the next word from the
+    ; bottom row to the top row every line advance (the just-read line
+    ; vanished instantly — user: "jumps the next word to the first
+    ; line"). Now the amber line anchors MID-PANEL (row ceil(N/2) of N
+    ; visible lines): at the 2-line default that is still row 1
+    ; (identical to the validated baseline), but at 3+ lines the active
+    ; line sits mid-window with unread text visible BELOW it — each
+    ; advance slides one row instead of page-flipping, and the just-read
+    ; line stays on screen (teleprompter research: upcoming-text preview
+    ; below the active line is the natural reading-aid model).
     pos := SendMessage(0x0426, charIdx, 0, reHwnd)
     y := pos >> 16
     ; Line pitch measured live (view-relative y is scroll-invariant):
@@ -2147,16 +2196,105 @@ ScrollWordIntoView(reHwnd, charIdx) {
     rc := Buffer(16, 0)
     DllCall("GetClientRect", "ptr", reHwnd, "ptr", rc)
     clientH := NumGet(rc, 12, "Int")
-    if (y < 0 or y + pitch > clientH) {
-        line := SendMessage(0x00C9, charIdx, 0, reHwnd)  ; EM_LINEFROMCHAR
+    ; Mid-panel anchor row: the amber line lands at row ceil(N/2)
+    ; (1-based). Row 1 at N=2 — the 2-line default behaves exactly as
+    ; shipped; rows 2/2/3 at N=3/4/5. visLines is measured LIVE from
+    ; client/pitch (the formula's line count is the design intent; the
+    ; control's actual pixel fit is the truth).
+    visLines := Max(1, Round(clientH / pitch))
+    anchorRow := (visLines + 1) // 2
+    topLine := Max(0, SendMessage(0x00C9, charIdx, 0, reHwnd) - (anchorRow - 1))
+    ; Fixed-anchor model: fire when the amber line drifts BELOW the
+    ; anchor row (y >= anchorRow*pitch → client row anchorRow+1) or
+    ; leaves the top (y<0, e.g. a backward seek). The amber word then
+    ; re-anchors AT the anchor row — its client position never changes
+    ; mid-read, the text slides one row underneath per line advance
+    ; (teleprompter model; the old bottom-edge y+pitch>clientH trigger
+    ; let the amber wander to the panel floor first, then teleport it
+    ; back to the top — the "jump" the user called out). RichEdit
+    ; snaps EM_SETSCROLLPOS targets to whole lines, so line-grain is the
+    ; native grain — no sub-line smooth scroll exists to add.
+    if (y < 0 or y >= anchorRow * pitch) {
         pt := Buffer(8, 0)
         NumPut("Int", 0, pt, 0)
-        NumPut("Int", line * pitch, pt, 4)
+        NumPut("Int", topLine * pitch, pt, 4)
         SendMessage(0x04DE, 0, pt.Ptr, reHwnd)
     }
     ; Words already inside the band: no scroll — mid-line words never
     ; micro-move. The 0.4s hold packet at read start also doesn't scroll:
     ; char 0 is always visible.
+}
+
+; EnsureOverlayLineFit: grow the panel until `intendedLines` COMPLETE line
+; boxes fit the RichEdit client. The height formula assumes line pitch
+; scales exactly linearly with zoom (28px * uiScale), but RichEdit rounds
+; line boxes UP (probe 2026-09-10: 46px measured at 1.6x zoom vs 44.8
+; formula) — the formula-built panel came up ~5px short at 4 lines and the
+; bottom line clipped. Measure the REAL pitch post-build and grow by the
+; shortfall; self-correcting against any font-metric, DPI, or rounding
+; drift. Bottom edge stays on-screen: the top edge moves up (the clamp),
+; so status line + grip keep their screen position.
+EnsureOverlayLineFit(reHwnd, intendedLines) {
+    global HighlightGui, OverlayStatusCtrl, OverlayGripCtrl, gOverlayDpi, gOverlayScale
+    if (HighlightGui = "" or intendedLines < 1) {
+        return
+    }
+    uiScale := (gOverlayDpi / 96.0) * gOverlayScale
+    ; Pitch measured exactly as ScrollWordIntoView measures it (lines 0/1,
+    ; view-relative y — scroll-invariant). Single-line docs keep 28.
+    pitch := 28
+    if (SendMessage(0x00BA, 0, 0, reHwnd) > 1) {
+        c0 := SendMessage(0x00BB, 0, 0, reHwnd)
+        c1 := SendMessage(0x00BB, 1, 0, reHwnd)
+        pitch := (SendMessage(0x0426, c1, 0, reHwnd) >> 16) - (SendMessage(0x0426, c0, 0, reHwnd) >> 16)
+        if (pitch <= 0) {
+            pitch := 28
+        }
+    }
+    rc := Buffer(16, 0)
+    DllCall("GetClientRect", "ptr", reHwnd, "ptr", rc)
+    clientH := NumGet(rc, 12, "Int")
+    ; +2px: guard the last line box against client-edge off-by-ones.
+    needed := intendedLines * pitch + 2
+    if (clientH >= needed) {
+        return
+    }
+    ; LOOP the growth: a single Move does not always settle client
+    ; geometry (probe 2026-09-10: one 31px grow left clientH=155 for
+    ; needed=186 — the child Move lands on a later message-pump pass).
+    ; Iterate measure→grow up to 4 rounds until the intended lines fit.
+    try {
+        reCtrl := HighlightGui["RichEdit50W1"]
+        loop 4 {
+            if (clientH >= needed) {
+                break
+            }
+            shortfall := needed - clientH
+            WinGetPos &px, &py, &pw, &ph, "ahk_id " . HighlightGui.Hwnd
+            newH := ph + shortfall
+            if (py + newH > A_ScreenHeight) {
+                py := A_ScreenHeight - newH
+            }
+            if (py < 0) {
+                py := 0
+            }
+            HighlightGui.Move(px, py, pw, newH)
+            ; Same inset math as build/zoom paths; the RichEdit grows by
+            ; the full shortfall, status + grip re-derive from the height.
+            reCtrl.Move(Round(18 * uiScale), Round(14 * uiScale), pw - Round(36 * uiScale), (ph - Round(52 * uiScale)) + shortfall)
+            if (IsObject(OverlayStatusCtrl)) {
+                try OverlayStatusCtrl.Move(Round(18 * uiScale), newH - Round(24 * uiScale), pw - Round(36 * uiScale), Round(18 * uiScale))
+            }
+            if (IsObject(OverlayGripCtrl)) {
+                try OverlayGripCtrl.Move(pw - Round(30 * uiScale), newH - Round(28 * uiScale))
+            }
+            DllCall("GetClientRect", "ptr", reHwnd, "ptr", rc)
+            clientH := NumGet(rc, 12, "Int")
+            DebugLog "  EnsureOverlayLineFit: grew " . shortfall . "px (clientH=" . clientH . " needed=" . needed . " pitch=" . pitch . ")"
+        }
+    } catch as e {
+        DebugLog "  EnsureOverlayLineFit failed: " . e.Message
+    }
 }
 
 HideHighlightOverlay() {
