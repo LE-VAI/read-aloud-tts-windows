@@ -126,7 +126,11 @@ foreach ($term in $dynamicTerms) {
     }
 }
 
-$patterns.Add([pscustomobject]@{ Kind = "Internal-role term"; Regex = "(?i)\b(operator|operator)\b" })
+# Split-string so this file never matches its own rule (same convention as
+# the privateTerms list above).
+$internalRoleTerms = @(("oper" + "ator"), ("Comm" + "ander"))
+$internalRoleRegex = "(?i)\b(" + (($internalRoleTerms | ForEach-Object { [regex]::Escape($_) }) -join "|") + ")\b"
+$patterns.Add([pscustomobject]@{ Kind = "Internal-role term"; Regex = $internalRoleRegex })
 
 foreach ($term in $privateTerms) {
     $patterns.Add([pscustomobject]@{ Kind = "Private/internal term"; Regex = [regex]::Escape($term) })
