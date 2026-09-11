@@ -20,12 +20,26 @@
   color functions can silently drop inside ::highlight() paint rules).
 -->
 <style>
-  :root { color-scheme: dark; }
+  /* Grey-glass surface system — values only, zero logic. Structure:
+     the page is the near-black stage (the "backdrop" the panel floats
+     on), #reading-panel is the frosted panel (Apple "elevated" surface:
+     depth from surface lightness, not from heavy borders or shadows),
+     separated by hairlines, never hard color snaps. */
+  :root {
+    color-scheme: dark;
+    --surface-page: #0b0c0f;
+    --surface-panel: rgb(24 26 30 / 0.72);
+    --surface-panel-edge: rgb(255 255 255 / 0.09);
+    --text-primary: #f5f5f7;
+    --text-secondary: #9aa0ab;
+    --text-tertiary: #6f7580;
+    --ease: 150ms cubic-bezier(0.25, 0.1, 0.25, 1);
+  }
   html, body {
     margin: 0;
     padding: 0;
-    background: #16181d;
-    color: #e8e9ec;
+    background: var(--surface-page);
+    color: var(--text-primary);
   }
   body {
     font: 400 clamp(17px, 1.6vw + 12px, 24px)/1.9 ui-sans-serif, system-ui, sans-serif;
@@ -33,6 +47,27 @@
     box-sizing: border-box;
     padding: 52px clamp(18px, 5vw, 64px) 40px;
   }
+  /* The floating reading panel — soft graphite glass: translucent
+     surface, backdrop blur, hairline edge, near-invisible shadow.
+     Generous padding on a 4px grid. The fresh <read-along> mounts
+     INSIDE this panel (mountReader appends to it), so the karaoke
+     text lives on the frosted surface; placeholder shares the style. */
+  #reading-panel {
+    position: relative;
+    max-width: 680px;
+    margin: 0 auto;
+    padding: 28px 32px;
+    background: var(--surface-panel);
+    -webkit-backdrop-filter: blur(20px) saturate(140%);
+    backdrop-filter: blur(20px) saturate(140%);
+    border: 1px solid var(--surface-panel-edge);
+    border-radius: 20px;
+    box-shadow:
+      inset 0 1px 0 rgb(255 255 255 / 0.05),
+      0 8px 32px rgb(0 0 0 / 0.35);
+    transition: background var(--ease);
+  }
+  #reading-panel:empty { display: none; }
   #bar {
     position: fixed;
     left: 0; right: 0; top: 0;
@@ -40,30 +75,47 @@
     align-items: center;
     gap: 12px;
     padding: 8px clamp(18px, 5vw, 64px);
-    background: rgb(13 14 18 / 0.92);
-    border-bottom: 1px solid rgb(255 255 255 / 0.08);
+    background: rgb(11 12 15 / 0.85);
+    -webkit-backdrop-filter: blur(16px) saturate(140%);
+    backdrop-filter: blur(16px) saturate(140%);
+    border-bottom: 1px solid rgb(255 255 255 / 0.07);
     font-size: 13px;
-    color: #9aa0ab;
+    color: var(--text-secondary);
     z-index: 10;
     box-sizing: border-box;
+    transition: color var(--ease);
   }
   #dot {
     width: 8px; height: 8px;
     border-radius: 50%;
     background: #4a4f5a;
     flex: none;
-    transition: background 120ms linear;
+    transition: background var(--ease);
   }
   #dot.live { background: #79c47a; }
   #hint { margin-left: auto; white-space: nowrap; opacity: 0.8; }
-  #placeholder { color: #9aa0ab; font-size: 15px; }
-  #placeholder b { color: #d7dae0; }
+  #placeholder {
+    color: var(--text-secondary);
+    font-size: 15px;
+    line-height: 1.6;
+    padding: 0;
+    background: none;
+    border: none;
+  }
+  #placeholder:empty { display: none; }
+  #placeholder b { color: var(--text-primary); }
+  /* Visible keyboard focus (WCAG 2.4.7/2.4.11) — amber, 2px, ≥3:1. */
+  :focus-visible {
+    outline: 2px solid #ffc400;
+    outline-offset: 2px;
+    border-radius: 4px;
+  }
   read-along { --ra-highlight: %%HIGHLIGHT%%; --ra-accent: %%ACCENT%%; }
   #probe {
     position: fixed;
     left: 4px; bottom: 4px;
     font: 11px/1.4 ui-monospace, monospace;
-    color: #6f7580;
+    color: var(--text-tertiary);
     z-index: 10;
     white-space: pre;
   }
@@ -88,8 +140,10 @@
     <span id="status">Waiting for the reader…</span>
     <span id="hint">click a word to read from there</span>
   </div>
+  <div id="reading-panel">
   <div id="placeholder">Select text anywhere and press <b>Home</b> — the reading appears here with each word highlighted as it is spoken.</div>
   <div id="probe" hidden></div>
+  </div>
 
   <script type="module">
     import { ExternalEngine } from "/component/engines/external.js";
@@ -201,7 +255,7 @@
       reader = document.createElement("read-along");
       reader.setAttribute("seekable", "");
       reader.textContent = text;
-      document.body.appendChild(reader);
+      document.getElementById("reading-panel").appendChild(reader);
       engine = new ExternalEngine({ words: [] });
       reader.engine = engine;
       wireReader(reader);
