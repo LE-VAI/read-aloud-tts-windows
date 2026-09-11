@@ -777,7 +777,7 @@ FlashOverlaySpeed(speed, keepOld := false) {
     }
     try {
         s := Round(8 * gOverlayScale)
-        OverlayStatusCtrl.SetFont("s" . s . " cF2C14E")
+        OverlayStatusCtrl.SetFont("s" . s . " cFFC400")
         if (speed = -1) {
             OverlayStatusCtrl.Text := "  speed not set — daemon unreachable"
         } else {
@@ -1139,9 +1139,9 @@ ShowReplayBar() {
     global ReplayGui
     HideReplayBar()
     ReplayGui := Gui("+AlwaysOnTop -Caption +ToolWindow +E0x08000000")
-    ReplayGui.BackColor := "1a1a2e"
-    ReplayGui.SetFont("s11 cF2C14E", "Segoe UI")
-    btn := ReplayGui.Add("Text", "w90 h30 Center Background1a1a2e", "↻ Replay")
+    ReplayGui.BackColor := "181A1E"
+    ReplayGui.SetFont("s11 cFFC400", "Segoe UI")
+    btn := ReplayGui.Add("Text", "w90 h30 Center BackgroundTrans", "↻ Replay")
     btn.OnEvent("Click", (*) => ReplayLastText())
     ReplayGui.Show("x0 y0 Hide NA")
     ; Position bottom-right after sizing.
@@ -1282,7 +1282,7 @@ ShowHighlightOverlayInner(text) {
     ; Do NOT use +E0x20 (WS_EX_TRANSPARENT) — it makes the window invisible
     ; to mouse events, which would break dragging and click-to-rewind.
     HighlightGui := Gui("+AlwaysOnTop -Caption +ToolWindow +E0x08000000")
-    HighlightGui.BackColor := "16161D"
+    HighlightGui.BackColor := "181A1E"
     ; DPI-aware geometry: AHK v2 is not per-monitor DPI aware by default;
     ; scale the panel/font from the primary monitor's DPI at build time.
     try DllCall("SetProcessDpiAwarenessContext", "ptr", -4, "int")
@@ -1350,7 +1350,7 @@ ShowHighlightOverlayInner(text) {
     ; copy teaches the Space control; on pause it flips to amber
     ; "⏸ paused — Space resumes". Tiny, dim gray #9A9AA5 on the panel
     ; BackColor — never competes with the amber word.
-    OverlayStatusCtrl := HighlightGui.Add("Text", "x" . Round(18 * uiScale) . " w" . (panelWidth - Round(36 * uiScale)) . " h" . Round(18 * uiScale) . " c9A9AA5 Background16161D", "  Space pauses · click a word to jump · Ctrl+wheel zooms")
+    OverlayStatusCtrl := HighlightGui.Add("Text", "x" . Round(18 * uiScale) . " w" . (panelWidth - Round(36 * uiScale)) . " h" . Round(18 * uiScale) . " c9A9AA5 BackgroundTrans", "  Space pauses · click a word to jump · Ctrl+wheel zooms")
     HighlightGui.SetFont("s" . Round(8 * uiScale), "Segoe UI Variable Text")
     OverlayStatusCtrl.SetFont("s" . Round(8 * uiScale) . " c9A9AA5")
     ; Corner grip glyph (bottom-right): the drag-to-scale affordance. A
@@ -1360,7 +1360,7 @@ ShowHighlightOverlayInner(text) {
     ; right ~20x20 area of the panel, not this control's exact pixels: the
     ; glyph is the visual hint, the zone is the functional surface.
     try {
-        OverlayGripCtrl := HighlightGui.Add("Text", "x" . (panelWidth - Round(30 * uiScale)) . " y" . (panelHeight - Round(28 * uiScale)) . " w" . Round(16 * uiScale) . " h" . Round(16 * uiScale) . " c3F3F46 Background16161D Right", "◢")
+        OverlayGripCtrl := HighlightGui.Add("Text", "x" . (panelWidth - Round(30 * uiScale)) . " y" . (panelHeight - Round(28 * uiScale)) . " w" . Round(16 * uiScale) . " h" . Round(16 * uiScale) . " c9AA0AB BackgroundTrans Right", "◢")
         OverlayGripCtrl.SetFont("s" . Round(9 * uiScale), "Segoe UI")
     } catch as e {
         DebugLog "  grip glyph failed: " . e.Message
@@ -1371,8 +1371,10 @@ ShowHighlightOverlayInner(text) {
     ; EM_SETUNDOLIMIT 0: per-word recoloring creates undo records at 3+/s
     ; — pollute nothing on a display-only surface.
     SendMessage(0x0452, 0, 0, reHwnd)
-    ; EM_SETBKGNDCOLOR: dark surface matching the panel (BGR 0x1D1616).
-    SendMessage(0x0443, 0, 0x1D1616, reHwnd)
+    ; EM_SETBKGNDCOLOR: opaque dark core matching the glass tint
+    ; rgb(24,26,30) = #181A1E -> BGR 0x1E1A18 (RichEdit backgrounds are
+    ; always opaque; the layered alpha frost shows on the panel chrome).
+    SendMessage(0x0443, 0, 0x1E1A18, reHwnd)
     ; EM_EXLIMITTEXT: RichEdit's default ~32K would truncate long reads.
     SendMessage(0x0435, 0, 0x7FFFFFFE, reHwnd)
     ; EM_SETTEXTEX (0x0461): SETTEXTEX{flags=ST_DEFAULT, codepage=1200
@@ -1387,7 +1389,7 @@ ShowHighlightOverlayInner(text) {
     ; SCF_ALL (0x4 — NOT 0x8, which is SCF_USEUIRULES) with CFM_FACE|
     ; CFM_SIZE|CFM_COLOR. yHeight is TWIPS (points x 20): 16pt-class
     ; readable body = 320 twips (scaled by DPI at build time).
-    cf := MakeCharFormat(0x20000000 | 0x80000000 | 0x40000000, 0, Round(320 * uiScale), 0xE8E8E8, fontName)
+    cf := MakeCharFormat(0x20000000 | 0x80000000 | 0x40000000, 0, Round(320 * uiScale), 0xF7F5F5, fontName)
     docFmtRet := SendMessage(0x0444, 4, cf.Ptr, reHwnd)
     DebugLog "  EM_SETCHARFORMAT(SCF_ALL) ret=" . docFmtRet
     ; Word-wrap is ON by default in RichEdit — no EM_FMTLINES call needed
@@ -1416,9 +1418,11 @@ ShowHighlightOverlayInner(text) {
     if (gOverlayReducedMotion) {
         try DllCall("dwmapi\DwmSetWindowAttribute", "ptr", hwnd, "uint", 3, "int*", 1, "uint", 4)
     }
-    ; Opacity 243/255: near-opaque (guarantees 4.5:1 text contrast
-    ; worst-case, unlike the old 220) while keeping a subtle blend.
-    SetTranslucent(hwnd, 243)
+    ; Opacity 230/255: frosted glass matching the web overlay's
+    ; rgba(24,26,30,0.72) surface (243 was near-opaque). Contrast is
+    ; carried by the opaque RichEdit core; on the chrome the dimmest
+    ; token 9A9AA5 measures 5.02:1 worst-case (over white at 230).
+    SetTranslucent(hwnd, 230)
     DebugLog "  ShowHighlightOverlay BUILD COMPLETE"
     ; Demo child: report the build the moment it lands. A bare "start"
     ; packet carries no ms field, so the tick returns before its report
@@ -1473,7 +1477,7 @@ SetOverlayStatus(paused) {
     try {
         s := Round(8 * gOverlayScale)
         if (paused) {
-            OverlayStatusCtrl.SetFont("s" . s . " cF2C14E")
+            OverlayStatusCtrl.SetFont("s" . s . " cFFC400")
             OverlayStatusCtrl.Text := "  ⏸ paused — Space resumes"
         } else {
             OverlayStatusCtrl.SetFont("s" . s . " c9A9AA5")
@@ -1959,7 +1963,7 @@ ApplyOverlayScale(newScale) {
         reHwnd := 0
         try reHwnd := HighlightGui["RichEdit50W1"].Hwnd
         if (reHwnd != 0) {
-            cf := MakeCharFormat(0x20000000 | 0x80000000 | 0x40000000, 0, Round(320 * uiScale), 0xE8E8E8, "Segoe UI Variable Text")
+            cf := MakeCharFormat(0x20000000 | 0x80000000 | 0x40000000, 0, Round(320 * uiScale), 0xF7F5F5, "Segoe UI Variable Text")
             SendMessage(0x0444, 4, cf.Ptr, reHwnd)
             ; Re-color the current amber word NOW (don't wait for the next
             ; word boundary — under pause that's minutes away) and re-anchor
@@ -2141,9 +2145,9 @@ EnsureCharFormatPair(faceName) {
         ; highlight_color and the tray accent). CFM_COLOR only —
         ; recoloring must not touch size/face metrics (no reflow).
         gCfAmber := MakeCharFormat(0x40000000, 0, Round(320 * dpiScale), 0x00C4FF, faceName)
-        ; Base text #E8E8E8 -> BGR 0x00E8E8E8 (the BGR triple must be
-        ; fully spelled out: 0x00E8E8 would be #E8E800 yellow-green).
-        gCfBase := MakeCharFormat(0x40000000, 0, Round(320 * dpiScale), 0x00E8E8E8, faceName)
+        ; Base text #F5F5F7 -> BGR 0xF7F5F5 (the BGR triple must be
+        ; fully spelled out: 0xF7F5 would be #F5F700 yellow).
+        gCfBase := MakeCharFormat(0x40000000, 0, Round(320 * dpiScale), 0xF7F5F5, faceName)
     }
 }
 
@@ -2427,13 +2431,13 @@ ShowTranscript(*) {
     }
 
     TranscriptGui := Gui("+AlwaysOnTop +Resize +MinSize300x200", "ReadAloudTTS Transcript")
-    TranscriptGui.BackColor := "1a1a2e"
+    TranscriptGui.BackColor := "181A1E"
     TranscriptGui.SetFont("s12", "Segoe UI")
     ; Scrollable read-only Edit control (+VScroll shows the scrollbar so
     ; long transcripts can be navigated; previously -VScroll hid it).
     TranscriptGui.MarginX := 12
     TranscriptGui.MarginY := 12
-    editCtrl := TranscriptGui.Add("Edit", "w600 h400 +ReadOnly +VScroll +Wrap cWhite Background1a1a2e", text)
+    editCtrl := TranscriptGui.Add("Edit", "w600 h400 +ReadOnly +VScroll +Wrap cF5F5F7 Background181A1E", text)
     ; Close button.
     TranscriptGui.Add("Button", "default w120 x260 h32", "Close").OnEvent("Click", (*) => CloseTranscript())
     TranscriptGui.OnEvent("Close", (*) => CloseTranscript())

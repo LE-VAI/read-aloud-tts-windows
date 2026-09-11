@@ -665,8 +665,21 @@ class DemoPanel:
             m0 = panel_path.stat().st_mtime
         except OSError:
             m0 = 0.0
+        seq = 0
         while time.time() < deadline:
-            self.daemon.write_directive({"action": "panel_info"})
+            seq += 1
+            # Nonce per poll: DemoDirectivePoll drops byte-identical
+            # directives (static lastRaw gate). When the panel builds
+            # BEFORE this wait begins — the normal case on a warm machine,
+            # since begin_read's 0.6s hold outlives a cached AHK start —
+            # the build-time report is already on disk (mt == m0) and no
+            # playing packet flows until this call returns: an identical
+            # poll never triggers a report and the loop deadlocks into
+            # "demo panel never appeared". A nonce makes every poll
+            # produce a fresh live report; the mtime gate still blocks
+            # stale dead-hwnd reports from earlier builds (they are only
+            # older, never newer, than m0).
+            self.daemon.write_directive({"action": "panel_info", "seq": seq})
             time.sleep(0.15)
             p = self.daemon.read_panel(timeout_s=0.2)
             try:
