@@ -1,4 +1,4 @@
-$ErrorActionPreference = "Stop"
+﻿$ErrorActionPreference = "Stop"
 
 $scriptDir = Split-Path -Parent $PSCommandPath
 $repoRoot = Split-Path -Parent $scriptDir
@@ -24,6 +24,7 @@ $textExtensions = @(
 $textFiles = Get-ChildItem -LiteralPath $repoRoot -Recurse -File -Force |
     Where-Object {
         $_.FullName -notmatch "\\.git\\" -and
+        $_.FullName -ne $PSCommandPath -and
         (
             $textExtensions -contains $_.Extension.ToLowerInvariant() -or
             $_.Name -in @("LICENSE", "NOTICE", "README", ".gitignore")
@@ -86,7 +87,14 @@ if ($env:COMPUTERNAME) {
 
 $privateTerms = @(
     ("AT" + "LAS"),
+    ("1AT" + "LAS"),
+    ("internal_S" + "ESSION"),
     ("VAI" + "-WORLD"),
+    ("Comm" + "ander"),
+    ("SYN act" + "ivation"),
+    ("boyd" + "leon16"),
+    ("levai" + "nbey"),
+    ("Le V" + "ain"),
     ("Power" + "Shell history"),
     ("shell command" + " history"),
     ("chat trans" + "cript")
@@ -118,13 +126,17 @@ foreach ($term in $dynamicTerms) {
     }
 }
 
+$patterns.Add([pscustomobject]@{ Kind = "Internal-role term"; Regex = "(?i)\b(operator|operator)\b" })
+
 foreach ($term in $privateTerms) {
     $patterns.Add([pscustomobject]@{ Kind = "Private/internal term"; Regex = [regex]::Escape($term) })
 }
 
 foreach ($file in $textFiles) {
     $relative = Get-RelativePath $file.FullName
-    $lines = Get-Content -LiteralPath $file.FullName -ErrorAction Stop
+    $lines = @(
+        Get-Content -LiteralPath $file.FullName -ErrorAction Stop
+    )
     for ($index = 0; $index -lt $lines.Count; $index++) {
         $line = $lines[$index]
         foreach ($pattern in $patterns) {
