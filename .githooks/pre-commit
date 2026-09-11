@@ -1,0 +1,18 @@
+#!/bin/sh
+# Hard gate: sanitize check must pass before any commit can be created.
+# Runs the repo's own sanitize gate (same script CI runs) — if any private
+# term, absolute path, personal identifier, or forbidden artifact is staged
+# in a text file, the commit is refused with the offending lines shown.
+repo_root="$(git rev-parse --show-toplevel)"
+if [ -f "$repo_root/scripts/sanitize-check.ps1" ]; then
+  powershell.exe -NoProfile -ExecutionPolicy Bypass \
+    -File "$repo_root/scripts/sanitize-check.ps1"
+  rc=$?
+  if [ $rc -ne 0 ]; then
+    echo ""
+    echo "COMMIT BLOCKED: sanitize gate failed (see issues above)."
+    echo "Fix or remove the flagged content, then commit again."
+    exit $rc
+  fi
+fi
+exit 0
