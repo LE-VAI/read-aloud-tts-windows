@@ -7,7 +7,7 @@
   "inter_chunk_pause": 0.25,
   "length_scale": 1.0,
   "noise_scale": 0.667,
-  "noise_w": 0.8,
+  "noise_w": 0.3,
   "overlay_port": 8792,
   "highlight_color": "#FFC400",
   "voices": {
