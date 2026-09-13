@@ -93,6 +93,10 @@ $copyMap = @(
     @{ Source = Join-Path $srcDir "ReadAloudTTS.ahk"; Target = Join-Path $InstallDir "ReadAloudTTS.ahk" },
     @{ Source = Join-Path $srcDir "speak.py"; Target = Join-Path $InstallDir "speak.py" },
     @{ Source = Join-Path $srcDir "speak_server.py"; Target = Join-Path $InstallDir "speak_server.py" },
+    # speak_server imports word_timings at module level (word-level timings
+    # from Piper's phoneme alignments). Omitting it here fails a fresh install
+    # at import time, before any audio is produced.
+    @{ Source = Join-Path $srcDir "word_timings.py"; Target = Join-Path $InstallDir "word_timings.py" },
     @{ Source = Join-Path $srcDir "overlay_server.py"; Target = Join-Path $InstallDir "overlay_server.py" },
     @{ Source = Join-Path $srcDir "overlay.html"; Target = Join-Path $InstallDir "overlay.html" },
     @{ Source = Join-Path $srcDir "download_voices.ps1"; Target = Join-Path $InstallDir "download_voices.ps1" },
