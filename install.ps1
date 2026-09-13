@@ -99,7 +99,11 @@ $copyMap = @(
     @{ Source = Join-Path $srcDir "word_timings.py"; Target = Join-Path $InstallDir "word_timings.py" },
     @{ Source = Join-Path $srcDir "overlay_server.py"; Target = Join-Path $InstallDir "overlay_server.py" },
     @{ Source = Join-Path $srcDir "overlay.html"; Target = Join-Path $InstallDir "overlay.html" },
-    @{ Source = Join-Path $srcDir "download_voices.ps1"; Target = Join-Path $InstallDir "download_voices.ps1" },
+    # download_voices.ps1 lives at the REPO ROOT, not in src/ — pointing at
+    # $srcDir here made Copy-Item throw and aborted the whole install partway
+    # through (so the tray never came back and no files past this line were
+    # copied). Verified by auditing every copyMap source against the tree.
+    @{ Source = Join-Path $sourceDir "download_voices.ps1"; Target = Join-Path $InstallDir "download_voices.ps1" },
     @{ Source = Join-Path $sourceDir "uninstall.ps1"; Target = Join-Path $InstallDir "uninstall.ps1" },
     @{ Source = Join-Path $sourceDir "config.example.json"; Target = Join-Path $InstallDir "config.example.json" },
     @{ Source = Join-Path $sourceDir "refresh-readaloud.ps1"; Target = Join-Path $InstallDir "refresh-readaloud.ps1" },
