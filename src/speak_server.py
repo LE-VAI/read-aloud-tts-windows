@@ -53,6 +53,10 @@ from speak import (
     setup_logging,
     voice_files_exist,
 )
+from word_timings import (
+    compute_char_proportional,
+    compute_word_timings_aligned,
+)
 from overlay_server import (
     OverlayServer,
     file_request_sink,
@@ -140,6 +144,38 @@ def _load_voice(voice_id: str) -> Any:
     PiperVoice, _ = _ensure_piper()
     logging.info("Loading Piper model for voice: %s", voice_id)
     pv = PiperVoice.load(str(model_path), config_path=str(config_path))
+    # Expose the model's per-phoneme duration tensor so word timings can be
+    # EXACT instead of char-proportional (see word_timings.py).
+    #
+    # This must happen HERE, before the tuned session below, and the patched
+    # graph must be carried into that session as BYTES — not by re-loading the
+    # file. The tuned block rebuilds the InferenceSession from model_path, and
+    # an in-memory-only patch is discarded by that rebuild: verified by probe
+    # (tools_probe_session_patch.py — unpatched file exposes ['output'] only;
+    # patched bytes expose ['output','/Ceil_output_0']; and the tuned
+    # SessionOptions apply to those bytes unchanged). So `include_alignments=True`
+    # on the load ALONE would have silently produced no alignments at all.
+    #
+    # Failure is non-fatal: without the patch the timings fall back to
+    # char-proportion, which is the pre-existing behaviour.
+    _patched_model_bytes = None
+    try:
+        import onnx
+        from piper.patch_voice_with_alignment import add_alignment_output
+
+        _t_patch = time.time()
+        _model = onnx.load(str(model_path))
+        _tensor = add_alignment_output(_model)
+        _patched_model_bytes = _model.SerializeToString()
+        logging.info(
+            "Patched model for phoneme alignments in %dms (tensor=%s)",
+            int((time.time() - _t_patch) * 1000), _tensor,
+        )
+    except Exception as e:
+        logging.warning(
+            "Could not patch model for alignments (%s); word timings will use "
+            "the char-proportion fallback", e,
+        )
     # Replace the bare default InferenceSession that PiperVoice.load
     # creates with one carrying tuned ONNX Runtime SessionOptions.
     #
@@ -174,12 +210,17 @@ def _load_voice(voice_id: str) -> Any:
         so.add_session_config_entry("session.intra_op.spin_duration_us", "1000")
         so.add_session_config_entry("session.intra_op.spin_backoff_max", "8")
         providers = ["CPUExecutionProvider"]
+        # Build from the PATCHED BYTES when we have them, so the alignment
+        # output survives the session replacement. Falls back to the file path
+        # (unpatched) if patching was unavailable.
+        session_src = _patched_model_bytes if _patched_model_bytes else str(model_path)
         pv.session = ort.InferenceSession(
-            str(model_path), sess_options=so, providers=providers
+            session_src, sess_options=so, providers=providers
         )
         logging.info(
             "Replaced Piper session with tuned ORT session "
-            "(intra_op_num_threads=1, spin enabled)"
+            "(intra_op_num_threads=1, spin enabled, alignments=%s)",
+            "yes" if _patched_model_bytes else "no",
         )
     except Exception as e:
         # Don't break startup if this ORT version doesn't support the
@@ -300,23 +341,42 @@ def _silence_bytes(sample_rate: int, duration_s: float) -> bytes:
 _HIGHLIGHT_PATH = APP_DIR / "tmp" / "highlight_state.json"
 
 
-def _compute_word_timings(text: str, audio_samples: int, sample_rate: int) -> list[list]:
-    """Return [[word, start_ms, end_ms], ...] distributing audio duration by char count."""
-    tokens = re.findall(r"\S+", text)
-    if not tokens or audio_samples <= 0:
-        return []
-    total_chars = sum(len(t) for t in tokens)
-    if total_chars == 0:
-        return []
-    duration_ms = (audio_samples / sample_rate) * 1000.0
-    timings: list[list] = []
-    elapsed_ms = 0.0
-    for token in tokens:
-        frac = len(token) / total_chars
-        token_ms = duration_ms * frac
-        timings.append([token, round(elapsed_ms, 1), round(elapsed_ms + token_ms, 1)])
-        elapsed_ms += token_ms
-    return timings
+def _compute_word_timings(
+    text: str,
+    audio_samples: int,
+    sample_rate: int,
+    chunk_alignments: list | None = None,
+    voice: PiperVoice | None = None,
+) -> list[list]:
+    """Word timings, preferring the model's OWN phoneme alignments.
+
+    The aligned path is exact: Piper's VITS model predicts a per-phoneme
+    duration tensor as part of synthesis, and summing it per word gives the
+    word boundaries the vocoder was actually driven by. The char-proportional
+    path is a fallback and is measurably wrong — it gave "through" 331 ms of
+    highlight where the voice spent 116 ms, and "the" 142 ms where the voice
+    spent 70 ms (measured on the installed Lessac voice).
+
+    Falls back to char-proportion when alignments are unavailable (model not
+    patched, `onnx` missing) or when the group→token mapping cannot be made
+    exact for this text. A wrong highlight is worse than an approximate one,
+    which is why an inexact mapping refuses rather than guesses.
+    """
+    if chunk_alignments and voice is not None:
+        aligned = compute_word_timings_aligned(
+            text, chunk_alignments, voice.phonemize, sample_rate
+        )
+        if aligned:
+            logging.debug(
+                "Aligned word timings: %d words from %d alignment chunks",
+                len(aligned), len(chunk_alignments),
+            )
+            return aligned
+        logging.info(
+            "Alignment mapping was not exact for this text — "
+            "falling back to char-proportion"
+        )
+    return compute_char_proportional(text, audio_samples, sample_rate)
 
 
 def _write_highlight_state(state: dict[str, Any]) -> None:
@@ -354,18 +414,33 @@ def _synthesize_to_wav_bytes(
     text: str,
     syn_config: SynthesisConfig,
     sentence_silence: float,
-) -> tuple[bytes, int, int]:
+    want_alignments: bool = True,
+) -> tuple[bytes, int, int, list | None]:
     """Synthesize text to in-memory WAV bytes using the PiperVoice API.
 
     Iterates the synthesize() generator (one AudioChunk per sentence),
     concatenates audio_int16_bytes, and inserts sentence_silence between
     sentences (since SynthesisConfig has no sentence_silence field).
 
-    Returns (wav_bytes, total_samples, sample_rate).
+    Returns (wav_bytes, total_samples, sample_rate, chunk_alignments).
+
+    chunk_alignments is the per-chunk `phoneme_alignments` list (or None when
+    the voice/model could not provide them). Callers use it to derive EXACT
+    word timings from the model's own duration tensor instead of distributing
+    the audio duration by character count — see word_timings.py for why that
+    matters and what the error was.
+
+    `want_alignments=False` skips the extra per-chunk alignment retrieval for
+    callers that will not use it (keeps the fallback path's cost unchanged).
     """
-    chunks = list(voice.synthesize(text, syn_config))
+    # include_alignments=True asks the model to expose its per-phoneme
+    # duration tensor (w_ceil) so word timings can be exact instead of
+    # char-proportional. It is a byproduct of the same forward pass — no extra
+    # inference — and returns None alignments when the model has not been
+    # patched for it, which the caller handles by falling back.
+    chunks = list(voice.synthesize(text, syn_config, include_alignments=want_alignments))
     if not chunks:
-        return b"", 0, 0
+        return b"", 0, 0, None
 
     sample_rate = chunks[0].sample_rate
     silence = _silence_bytes(sample_rate, sentence_silence) if sentence_silence > 0 else b""
@@ -403,7 +478,16 @@ def _synthesize_to_wav_bytes(
         wav_file.setsampwidth(2)  # 16-bit
         wav_file.setnchannels(1)  # mono
         wav_file.writeframes(raw_pcm)
-    return wav_buf.getvalue(), total_samples, sample_rate
+
+    # Collect per-chunk alignments in the SAME ORDER the audio was written,
+    # so the caller's group walk lines up with the concatenated PCM.
+    chunk_alignments = None
+    if want_alignments:
+        chunk_alignments = [getattr(c, "phoneme_alignments", None) for c in chunks]
+        if not any(chunk_alignments):
+            chunk_alignments = None  # model not patched -> caller falls back
+
+    return wav_buf.getvalue(), total_samples, sample_rate, chunk_alignments
 
 
 def handle_speak(text: str, from_word: int = 0) -> dict[str, str]:
@@ -527,12 +611,14 @@ def handle_speak(text: str, from_word: int = 0) -> dict[str, str]:
 
     def synth_worker(ci: int, chunk_text: str) -> None:
         try:
-            wav_bytes, total_samples, sample_rate = synth_chunk(chunk_text)
+            wav_bytes, total_samples, sample_rate, chunk_alignments = synth_chunk(chunk_text)
             # Store RAW (un-offset) word timings; the playback loop applies
             # the offset when it consumes this chunk, because the offset
             # depends on cumulative playback time which only the playback
             # loop knows.
-            wtimings = _compute_word_timings(chunk_text, total_samples, sample_rate)
+            wtimings = _compute_word_timings(
+                chunk_text, total_samples, sample_rate, chunk_alignments, voice
+            )
             pending[ci] = (wav_bytes, total_samples, sample_rate, wtimings)
         except Exception as e:
             logging.error("Synth worker failed on chunk %d: %s", ci, e)
@@ -551,8 +637,10 @@ def handle_speak(text: str, from_word: int = 0) -> dict[str, str]:
                 if ci == 0:
                     # First chunk: synthesize synchronously on the playback
                     # thread so we can start audio as fast as possible.
-                    wav_bytes, total_samples, sample_rate = synth_chunk(chunk)
-                    wtimings = _compute_word_timings(chunk, total_samples, sample_rate)
+                    wav_bytes, total_samples, sample_rate, chunk_alignments = synth_chunk(chunk)
+                    wtimings = _compute_word_timings(
+                        chunk, total_samples, sample_rate, chunk_alignments, voice
+                    )
                     # Pad the word list back to full-document shape when this
                     # is a seek (from_word > 0): the first from_word_offset
                     # entries get zero-timed placeholders so the overlay's

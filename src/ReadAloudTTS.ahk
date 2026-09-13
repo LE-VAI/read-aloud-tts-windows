@@ -86,6 +86,14 @@ global gOverlayScale := 1.0
 ; every genuine (re)build request (HighlightOnStart new read) and at
 ; stop/teardown so the NEXT read always starts clean.
 global gOverlayDismissed := false
+; --- Bare-wheel scroll override (2026-09-12) ---
+; While the user is reading back through previous lines, auto-re-anchoring is
+; suspended so the view holds still. See OverlayWheelScrollOverride.
+global gScrollOverrideActive := false
+global gScrollOverrideUntil := 0
+; Allows disabling follow-mode entirely (a user who wants full manual control
+; of the panel). No UI toggle yet — a config field can drive this later.
+global gOverlayAutoScrollEnabled := true
 ; Drag offsets for the manual overlay drag (OverlayDragHandler).
 global gDragOffX := 0
 global gDragOffY := 0
@@ -227,7 +235,7 @@ OnMessage(0x7B, OverlayContextMenuSuppress)
 ; RichEdit's native wheel scroll AND its built-in Ctrl+wheel zoom (RichEdit
 ; 4.1 zooms natively; unsuppressed we'd double-step). Gated on Ctrl: a
 ; bare wheel over the panel stays native so any scroll instinct still works.
-OnMessage(0x020A, OverlayWheelZoomHandler)
+OnMessage(0x020A, OverlayWheelDispatch)
 
 ; Demo children never spawn a daemon: the Python director IS their
 ; daemon (it writes the same files the real one writes, with zero audio).
@@ -1668,6 +1676,22 @@ OverlayContextMenuSuppress(wParam, lParam, msg, hwnd) {
     return 1   ; swallow — no context menu, no Select All, on this surface
 }
 
+; ONE handler for WM_MOUSEWHEEL, dispatching on the Ctrl modifier.
+; AHK v2 OnMessage keeps a single handler per message id, so registering the
+; zoom handler and the scroll-override handler separately would silently
+; replace one with the other. The dispatcher is the only correct shape.
+OverlayWheelDispatch(wParam, lParam, msg, hwnd) {
+    ; Ctrl held -> zoom (and swallow, so RichEdit's built-in Ctrl+wheel zoom
+    ; does not double-apply).
+    if ((wParam & 0xFFFF & 0x0008) != 0) {
+        return OverlayWheelZoomHandler(wParam, lParam, msg, hwnd)
+    }
+    ; Bare wheel -> engage the scroll override, then LET THE MESSAGE THROUGH
+    ; (returning nothing) so the control scrolls natively.
+    OverlayWheelScrollOverride(wParam, lParam, hwnd)
+    return
+}
+
 ; Ctrl+wheel over the overlay = zoom (user feature 2026-09-08). Win10/11
 ; posts WM_MOUSEWHEEL directly to the window under the cursor (Raymond Chen
 ; 2016-04-20), so this fires while another app holds focus — but that also
@@ -1727,6 +1751,124 @@ OverlayWheelZoomHandler(wParam, lParam, msg, hwnd) {
     }
     ApplyOverlayScale(gOverlayScale * (1.1 ** steps))
     return 1   ; integer return: suppress native scroll AND native Ctrl+wheel zoom
+}
+
+; --- bare-wheel scroll override (user feature 2026-09-12) -------------------
+;
+; THE PROBLEM. The overlay auto-re-anchors the spoken line every time the word
+; advances. Previously a bare wheel did nothing useful on this surface (every
+; classic scroll route is dead on a readonly, no-WS_VSCROLL RichEdit — see
+; ScrollWordIntoView), and the OS posts WM_MOUSEWHEEL to the window under the
+; cursor, so a wheel flick over the panel reached a control that could not
+; scroll. Either way: NO way to glance back at a previous sentence, because
+; the next word advance would immediately pull the view back.
+;
+; THE FIX (WCAG 2.2.2 Pause/Stop/Hide — the auto-scroll starts on its own,
+; lasts >5s, and runs in parallel with other content, so a pause MECHANISM is
+; required; the scroll IS that mechanism, and it must be discoverable and its
+; state perceivable). Three states:
+;
+;   FOLLOWING  — normal: the spoken line is re-anchored as it advances.
+;   USER_OWNED — the user wheeled; auto-re-anchoring is SUSPENDED so they can
+;                read. The highlight keeps updating (that is data, not scroll).
+;   RETURNING  — one instant jump back to the spoken line, then FOLLOWING.
+;
+; WHY NO ANIMATION: EM_SETSCROLLPOS snaps to whole lines by design ("the
+; control checks the x and y coordinates and adjusts them... so that a
+; complete line is displayed at the top"). A 200-300ms animated return would
+; be 3-6 discrete line jumps in a 2-5 line window — visibly worse than one
+; jump, and worse for vestibular sensitivity. Instant is both better-looking
+; and the safer choice.
+;
+; RESUME CONDITION: the user gets HOLD_MS (4s) to read, OR the jump-back
+; happens early if the spoken word's line scrolls back into view. No product
+; publishes a resume timeout — the industry convention is distance-gated
+; (MUI X chat: a 150px buffer; Twitch: resume on reaching bottom). A pure
+; distance gate is ambiguous in a 2-line window, so this is a hybrid: time as
+; the floor, distance as the earlier exit.
+OverlayWheelScrollOverride(wParam, lParam, hwnd) {
+    global HighlightGui, gScrollOverrideUntil, gScrollOverrideActive
+    global gLastAutoTopLine, gOverlayAutoScrollEnabled
+
+    ; Ctrl is the zoom gesture — leave it entirely to the zoom handler.
+    if ((wParam & 0xFFFF & 0x0008) != 0) {
+        return false
+    }
+    ; User can disable the whole follow behaviour.
+    if (!gOverlayAutoScrollEnabled) {
+        return false
+    }
+    ; Only for the overlay panel (same parent-chain walk as the zoom handler,
+    ; because the OS posts to whichever child is under the cursor).
+    walk := hwnd
+    found := false
+    loop 8 {
+        if (HighlightGui != "" and walk = HighlightGui.Hwnd) {
+            found := true
+            break
+        }
+        parent := DllCall("GetParent", "ptr", walk, "ptr")
+        if (parent = 0) {
+            break
+        }
+        walk := parent
+    }
+    if (!found) {
+        return false
+    }
+
+    gScrollOverrideActive := true
+    gScrollOverrideUntil := A_TickCount + 4000
+    ; Perceivable state, not a silent flag (WCAG 2.2.2). Shown in the status
+    ; line so the panel does not change size and the reader is told why the
+    ; text stopped following.
+    OverlayScrollHint("↕ reading back — resumes in 4s")
+    DebugLog "wheel: scroll override engaged for 4000ms"
+    ; CRITICAL: return false, NOT 1. An integer return SUPPRESSES the message,
+    ; so the wheel never reaches the control and the panel would appear frozen
+    ; — the exact opposite of the feature. Letting it through means RichEdit
+    ; does whatever scrolling it can natively.
+    return false
+}
+
+; Called from the highlight tick when a new word is colored. Returns true if
+; the caller should re-anchor the view, false while the user owns it.
+OverlayMayAutoScroll() {
+    global gScrollOverrideActive, gScrollOverrideUntil, gScrollOverrideHint
+    if (!gScrollOverrideActive) {
+        return true
+    }
+    ; The user's window expired — hand control back.
+    if (A_TickCount >= gScrollOverrideUntil) {
+        gScrollOverrideActive := false
+        OverlayScrollHint("")
+        DebugLog "wheel: scroll override expired, resuming follow"
+        return true
+    }
+    return false
+}
+
+; Perceivable state cue (WCAG 2.2.2 requires the paused state be knowable, not
+; a silent flag). Shown in the existing status line so no layout changes.
+OverlayScrollHint(text) {
+    global OverlayStatusCtrl, HighlightPaused, gOverlayScale
+    if (HighlightPaused) {
+        return   ; the pause indicator owns the status line while paused
+    }
+    if (!IsObject(OverlayStatusCtrl)) {
+        return
+    }
+    try {
+        if (text = "") {
+            OverlayStatusCtrl.SetFont("s" . Round(10 * gOverlayScale) . " c9A9AA5")
+            OverlayStatusCtrl.Text := "Space pauses"
+        } else {
+            OverlayStatusCtrl.SetFont("s" . Round(10 * gOverlayScale) . " cFFC400")
+            OverlayStatusCtrl.Text := text
+        }
+    } catch {
+        ; status line gone (panel rebuilding) — the hint is not critical
+    }
 }
 
 OverlayDragHandler(wParam, lParam, msg, hwnd) {
@@ -2223,7 +2365,11 @@ SelectOverlayWord(idx) {
     ; so its line becomes the TOP visible line. Page-flip at reading
     ; pace avoids any jitter/oscillation from continuous micro-scrolls.
     ColorWordRange(reHwnd, charStart, charEnd, gCfAmber)
-    ScrollWordIntoView(reHwnd, charStart)
+    ; The highlight always updates — it is data, not scroll. Only the VIEW
+    ; re-anchoring yields to the user while they read back.
+    if (OverlayMayAutoScroll()) {
+        ScrollWordIntoView(reHwnd, charStart)
+    }
     HighlightLastColored := idx
 }
 
