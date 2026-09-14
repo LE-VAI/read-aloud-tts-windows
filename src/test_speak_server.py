@@ -281,6 +281,232 @@ def test_reset_speed_inverse_nudge_reaches_normal():
 
 
 # ---------------------------------------------------------------------------
+# Stability guards (2026-09-13 long-session pass)
+#
+# Every test here corresponds to a stall that was either reproduced or found
+# by inspection. They are the regression fence around "RAT must never hang".
+# ---------------------------------------------------------------------------
+
+def test_synthesis_watchdog_returns_fast_result():
+    """A normal (fast) synthesis must pass straight through the watchdog."""
+    import speak_server
+
+    result = speak_server._synth_with_deadline(lambda: ("wav", 1, 2, None), "hello")
+    assert result == ("wav", 1, 2, None)
+
+
+def test_synthesis_watchdog_propagates_real_errors():
+    """A raising synthesis must re-raise, not be swallowed or misreported."""
+    import speak_server
+
+    def boom():
+        raise ValueError("phonemizer exploded")
+
+    try:
+        speak_server._synth_with_deadline(boom, "hello")
+    except ValueError as e:
+        assert "phonemizer exploded" in str(e)
+    else:
+        raise AssertionError("watchdog swallowed the synthesis exception")
+
+
+def test_synthesis_watchdog_bounds_a_wedge():
+    """THE STALL: a synthesis that never returns must be abandoned.
+
+    Before this guard, a wedged phonemizer held _playback_lock forever and
+    every later read produced no audio until the daemon was restarted. The
+    watchdog must raise TimeoutError within the deadline rather than block.
+    """
+    import threading
+    import time as _time
+
+    import speak_server
+
+    release = threading.Event()
+    original_min = speak_server._SYNTH_MIN_DEADLINE_S
+    speak_server._SYNTH_MIN_DEADLINE_S = 0.3  # keep the test fast
+    try:
+        t0 = _time.monotonic()
+        try:
+            speak_server._synth_with_deadline(lambda: release.wait(30), "hello")
+        except TimeoutError:
+            elapsed = _time.monotonic() - t0
+            assert elapsed < 5.0, f"watchdog took {elapsed:.1f}s to give up"
+        else:
+            raise AssertionError("watchdog did not abandon a wedged synthesis")
+    finally:
+        speak_server._SYNTH_MIN_DEADLINE_S = original_min
+        release.set()
+
+
+def test_synthesis_watchdog_marks_engine_degraded():
+    """A wedge must be observable, not silent."""
+    import threading
+
+    import speak_server
+
+    release = threading.Event()
+    original_min = speak_server._SYNTH_MIN_DEADLINE_S
+    speak_server._SYNTH_MIN_DEADLINE_S = 0.2
+    speak_server._engine_degraded = False
+    try:
+        try:
+            speak_server._synth_with_deadline(lambda: release.wait(10), "x")
+        except TimeoutError:
+            pass
+        assert speak_server._engine_degraded is True, (
+            "a wedged synthesis must raise the degraded flag"
+        )
+    finally:
+        speak_server._SYNTH_MIN_DEADLINE_S = original_min
+        speak_server._engine_degraded = False
+        release.set()
+
+
+def test_synth_deadline_scales_with_text_length():
+    """The deadline is length-aware but always has a generous floor."""
+    import speak_server
+
+    floor = speak_server._synth_deadline_for("short")
+    assert floor == speak_server._SYNTH_MIN_DEADLINE_S
+    big = speak_server._synth_deadline_for("x" * 10000)
+    assert big > floor, "a long chunk must get a longer budget than a short one"
+
+
+def test_heartbeat_text_produces_audio():
+    """The keep-warm probe must use text that actually synthesizes.
+
+    The shipped value used to be a single space, which phonemizes to a
+    boundary-only sequence: zero audio bytes, so the 5s keep-alive exercised
+    nothing while looking perfectly healthy.
+    """
+    import speak_server
+
+    assert speak_server._HEARTBEAT_TEXT.strip(), (
+        "heartbeat text must contain a pronounceable character, not whitespace"
+    )
+
+
+def test_safe_playsound_cancel_survives_audio_failure():
+    """A failing audio stack must not raise out of the cancel helper.
+
+    winsound raises RuntimeError when the system reports an error (device
+    change / no endpoint). Inside handle_speak's finally that would have
+    skipped the temp-dir cleanup and leaked it.
+    """
+    import winsound
+
+    import speak_server
+
+    original = winsound.PlaySound
+    try:
+        def boom(sound, flags):
+            raise RuntimeError("no audio device")
+
+        winsound.PlaySound = boom
+        speak_server._safe_playsound_cancel()  # must not raise
+    finally:
+        winsound.PlaySound = original
+
+
+def test_sweep_stale_playback_dirs_removes_old_keeps_new(tmp_path, monkeypatch):
+    """The startup sweep reclaims old dirs and never touches a live one."""
+    import os
+    import time as _time
+
+    import speak_server
+
+    monkeypatch.setattr(speak_server, "TMP_DIR", tmp_path)
+    old_dir = tmp_path / "playback-old"
+    new_dir = tmp_path / "playback-live"
+    old_dir.mkdir()
+    new_dir.mkdir()
+    (old_dir / "play-0000.wav").write_bytes(b"x" * 100)
+    (new_dir / "play-0000.wav").write_bytes(b"x" * 100)
+
+    # Backdate the old one well past the age gate.
+    stale = _time.time() - 3600
+    os.utime(old_dir, (stale, stale))
+
+    removed = speak_server._sweep_stale_playback_dirs(max_age_s=300.0)
+
+    assert removed == 1, f"expected 1 swept dir, got {removed}"
+    assert not old_dir.exists(), "the stale dir must be gone"
+    assert new_dir.exists(), "a recent (possibly live) dir must be preserved"
+
+
+def test_config_cache_serves_repeat_reads_without_hitting_disk(monkeypatch):
+    """load_config must not be called once per chunk from the hot path."""
+    import speak_server
+
+    calls = {"n": 0}
+    real = speak_server.load_config
+
+    def counting():
+        calls["n"] += 1
+        return real()
+
+    speak_server._invalidate_config_cache()
+    monkeypatch.setattr(speak_server, "load_config", counting)
+    try:
+        speak_server._cached_config()
+        speak_server._cached_config()
+        speak_server._cached_config()
+        assert calls["n"] == 1, f"expected 1 disk read, got {calls['n']}"
+    finally:
+        speak_server._invalidate_config_cache()
+        monkeypatch.setattr(speak_server, "load_config", real)
+
+
+def test_config_cache_invalidated_by_write():
+    """A speed/voice change must be visible to the very next read."""
+    import speak_server
+
+    speak_server._invalidate_config_cache()
+    speak_server._cached_config()
+    assert speak_server._config_cache is not None
+    speak_server._invalidate_config_cache()
+    assert speak_server._config_cache is None
+
+
+def test_tray_script_parses():
+    """AHK-LEVEL OUTAGE GUARD: the shipped .ahk must be syntactically valid.
+
+    A syntax error in the tray script makes AutoHotkey pop a modal error dialog
+    and kills every hotkey until it is dismissed — a total outage from the
+    user's seat, and one this project has hit twice in live use. Nothing else
+    in the suite parses the AHK file.
+
+    Skips (does not fail) when AutoHotkey is not installed, so the suite stays
+    runnable on machines and CI images without it. CI installs the interpreter
+    and runs check_ahk_syntax.py directly, so the gate is never dormant there.
+    """
+    import speak_server  # noqa: F401  (ensures src is on sys.path)
+
+    import check_ahk_syntax
+
+    ahk = check_ahk_syntax.find_ahk()
+    if ahk is None:
+        import pytest
+
+        pytest.skip("AutoHotkey interpreter not installed")
+
+    # Pass the target EXPLICITLY: under pytest, sys.argv holds the collected
+    # test files, so letting the gate infer its own target validated the wrong
+    # file (it reported a parse failure against test_speak.py).
+    tray = Path(__file__).resolve().parent / "ReadAloudTTS.ahk"
+    rc = check_ahk_syntax.main(tray)
+    # rc == 2 means "interpreter not found" — only reachable if lookup and the
+    # main() probe disagree. Treat as skip, not as a parse failure.
+    if rc == 2:
+        import pytest
+
+        pytest.skip("AutoHotkey interpreter not usable from this process")
+
+    assert rc == 0, "src/ReadAloudTTS.ahk failed to parse — see output above"
+
+
+# ---------------------------------------------------------------------------
 # Runner for manual execution (python src/test_speak_server.py)
 # ---------------------------------------------------------------------------
 

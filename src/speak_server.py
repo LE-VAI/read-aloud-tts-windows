@@ -31,9 +31,11 @@ import re
 import shutil
 import struct
 import sys
+import tempfile
 import threading
 import time
 import wave
+import winsound
 from collections import OrderedDict
 from pathlib import Path
 from typing import Any
@@ -120,6 +122,73 @@ _runtime_length_scale: float | None = None
 # Heartbeat stop flag — set to True on quit so the keep-alive thread
 # exits cleanly instead of being killed mid-synthesize.
 _heartbeat_stop = threading.Event()
+# Short-TTL config cache (see _cached_config). Invalidated on every write.
+_config_cache: dict[str, Any] | None = None
+_config_cache_ts = 0.0
+
+
+def _cached_config(ttl_s: float = 1.0) -> dict[str, Any]:
+    """load_config() with a short TTL cache.
+
+    The playback loop calls load_config() once per chunk (to re-read speed
+    changes) and the heartbeat calls it every 5s. Each call is a full
+    open+read+json.loads of config.json. That is cheap once, but over a long
+    read it is thousands of file opens, and the file is also rewritten by
+    set_speed/set_voice — so it is a shared read/write file being hammered
+    from the hot path.
+
+    A 1-second TTL keeps the semantics that matter (an on-the-fly speed
+    change is picked up within a second, well inside a chunk's duration)
+    while removing the per-chunk disk hit. Writes still go through
+    save_config immediately; the cache is invalidated on any write.
+    """
+    global _config_cache, _config_cache_ts
+    now = time.time()
+    if _config_cache is not None and (now - _config_cache_ts) < ttl_s:
+        return _config_cache
+    _config_cache = load_config()
+    _config_cache_ts = now
+    return _config_cache
+
+
+def _invalidate_config_cache() -> None:
+    global _config_cache, _config_cache_ts
+    _config_cache = None
+    _config_cache_ts = 0.0
+
+
+def _sweep_stale_playback_dirs(max_age_s: float = 300.0) -> int:
+    """Delete leftover playback-* temp dirs from earlier, uncleanly-ended runs.
+
+    Each read creates tmp/playback-XXXX/ and removes it in a finally. Six such
+    dirs (7MB) were found still on disk in the installed copy dated July 4-5,
+    i.e. from the very first days of this build — they survive when the
+    process dies without running its finally: taskkill, a crash, or an OS
+    shutdown mid-read. Over a long-lived install that is an unbounded disk
+    leak in the user's own AppData.
+
+    Age-gated to 5 minutes so a dir belonging to a read that is happening
+    RIGHT NOW (a second daemon instance, or this one before the sweep) is
+    never touched.
+    """
+    removed = 0
+    try:
+        now = time.time()
+        for path in TMP_DIR.glob("playback-*"):
+            if not path.is_dir():
+                continue
+            try:
+                if now - path.stat().st_mtime < max_age_s:
+                    continue
+                shutil.rmtree(path, ignore_errors=True)
+                removed += 1
+            except OSError:
+                continue
+    except OSError:
+        pass
+    if removed:
+        logging.info("Swept %d stale playback temp dir(s) from previous runs", removed)
+    return removed
 
 
 def _load_voice(voice_id: str) -> Any:
@@ -260,32 +329,73 @@ def _load_voice(voice_id: str) -> Any:
 # discarded (we never call winsound), so there's no audible artifact.
 
 _HEARTBEAT_INTERVAL_S = 5.0
-_HEARTBEAT_TEXT = " "
+# A real word, not a space. Measured 2026-09-13: a single space phonemizes to
+# a boundary-only sequence and yields ZERO audio bytes, so the old keep-warm
+# tick called synthesize() and got nothing back — it exercised nothing, and a
+# wedged session would have looked perfectly "warm" forever. "ok" produces a
+# real vowel, ~2-3 phonemes, still far under a millisecond of audio.
+_HEARTBEAT_TEXT = "ok"
+# Health counters, read by the request loop's self-check.
+_heartbeat_ok = 0
+_heartbeat_fail = 0
+_last_heartbeat_ts = 0.0
 
 
 def _heartbeat_loop() -> None:
-    """Background thread: synthesize a single space every 5s to keep ORT warm."""
+    """Background thread: synthesize a real short word every 5s to keep ORT warm.
+
+    Two hardening rules (2026-09-13 stability pass):
+
+    1. It SKIPS while a read is in progress. The keep-warm purpose is only to
+       stop ORT's intra-op pool from parking during IDLE stretches; during a
+       read the session is exercised continuously, so a tick adds nothing. It
+       also removes a real hazard: the tick and the playback thread would
+       otherwise phonemize CONCURRENTLY on the same voice object, and Piper's
+       phonemization runs through a single embedded espeak-ng instance whose
+       thread-safety is not guaranteed (espeak-ng has open hangs and crashes —
+       issues #996/#824). Serializing them costs nothing and deletes the risk.
+
+    2. It ASSERTS a nonzero result. A tick that only calls synthesize() and
+       discards the output cannot distinguish "warm" from "wedged" — it would
+       happily keep a hung session looking healthy. Counting bytes turns the
+       heartbeat into an actual liveness probe.
+    """
+    global _heartbeat_ok, _heartbeat_fail, _last_heartbeat_ts
     logging.info("heartbeat thread started (interval=%.1fs)", _HEARTBEAT_INTERVAL_S)
     while not _heartbeat_stop.wait(_HEARTBEAT_INTERVAL_S):
         try:
+            if _playback_lock.locked():
+                # A read owns the voice right now; it is exercising the
+                # session itself. Don't phonemize concurrently.
+                continue
             voice_id = _current_voice_id
             if voice_id is None:
                 continue
             pv = _voice_cache.get(voice_id)
             if pv is None:
                 continue
-            # synthesize_stream_raw yields raw int16 PCM chunks; we
-            # consume and discard them. Use the cached SynthesisConfig
-            # if one is available, else fall back to defaults.
-            config = load_config()
-            syn_config = _build_syn_config(config)
-            for _chunk in pv.synthesize_stream_raw(_HEARTBEAT_TEXT, syn_config):
-                pass
+            syn_config = _build_syn_config(_cached_config())
+            produced = 0
+            for chunk in pv.synthesize_stream_raw(_HEARTBEAT_TEXT, syn_config):
+                produced += len(chunk)
+            _last_heartbeat_ts = time.time()
+            if produced:
+                _heartbeat_ok += 1
+            else:
+                _heartbeat_fail += 1
+                logging.warning(
+                    "Heartbeat produced no audio for %r — synthesis may be "
+                    "wedged (ok=%d fail=%d)",
+                    _HEARTBEAT_TEXT, _heartbeat_ok, _heartbeat_fail,
+                )
         except Exception as e:
             # Heartbeat failures must never kill the thread or break
             # the daemon — log and continue. The next tick will retry.
+            _heartbeat_fail += 1
             logging.debug("heartbeat tick skipped: %s", e)
-    logging.info("heartbeat thread stopping")
+    logging.info(
+        "heartbeat thread stopping (ok=%d fail=%d)", _heartbeat_ok, _heartbeat_fail
+    )
 
 
 def _start_heartbeat() -> None:
@@ -321,6 +431,101 @@ def _silence_bytes(sample_rate: int, duration_s: float) -> bytes:
     if num_samples <= 0:
         return b""
     return struct.pack(f"<{num_samples}h", *([0] * num_samples))
+
+
+# ---------------------------------------------------------------------------
+# Synthesis watchdog
+# ---------------------------------------------------------------------------
+#
+# THE FAILURE THIS PREVENTS (stability pass 2026-09-13). handle_speak holds
+# _playback_lock for the entire read, and chunk 0 is synthesized INLINE while
+# holding it. Neither ORT nor Piper offers any timeout, and the phonemizer
+# runs through an embedded espeak-ng — a component with documented
+# indefinite hangs (espeak-ng#996: "the executable hangs indefinitely") and
+# input-triggered crashes (#824). One such hang therefore held the lock
+# forever, and because a takeover's join(3) times out and leaves the wedged
+# worker alive still holding it, EVERY later read blocked on that lock and
+# produced no audio until the daemon was restarted. From the user's seat the
+# app was simply dead — the worst possible outcome, and silent.
+#
+# Layer 1 here bounds the synthesis call itself. The deadline is deliberately
+# far above any real synthesis (a 600-char chunk is sub-second even on a slow
+# CPU) so it can only fire on a genuine wedge, never on a slow-but-working
+# machine.
+_SYNTH_MIN_DEADLINE_S = 20.0
+_SYNTH_CHARS_PER_SEC = 40.0  # generous floor; real throughput is 50x this
+_engine_degraded = False
+
+
+def _synth_deadline_for(text: str) -> float:
+    """Deadline for synthesizing `text`, scaled to its length."""
+    return max(_SYNTH_MIN_DEADLINE_S, len(text) / _SYNTH_CHARS_PER_SEC)
+
+
+def _safe_playsound_cancel() -> None:
+    """Cancel any playing audio, tolerating a failing audio stack.
+
+    winsound.PlaySound raises RuntimeError when "the system indicates an
+    error" (CPython docs). That is a real possibility on a machine whose
+    default audio endpoint is being changed — Bluetooth connect/disconnect,
+    USB headset swap, dock — which is exactly when a user notices. An
+    unhandled raise here happens inside the playback thread's `finally`,
+    where it would skip the temp-dir cleanup and skip the generation/stop
+    bookkeeping below it, leaving the read in a half-torn-down state. The
+    cancel is best-effort by nature, so it never propagates.
+    """
+    try:
+        winsound.PlaySound(None, 0)
+    except RuntimeError as e:
+        # The documented failure: "If the system indicates an error,
+        # RuntimeError is raised." Expected on a device change; not our bug.
+        logging.warning("winsound cancel failed (audio device unavailable?): %s", e)
+    except Exception as e:  # noqa: BLE001
+        # Anything else is a real defect in this daemon (a NameError here
+        # silently disabled cancellation once already). Log it at ERROR so it
+        # cannot hide, but still never propagate: this runs in a `finally`.
+        logging.error(
+            "UNEXPECTED error cancelling audio (%s: %s) — this is a bug, "
+            "not a device problem", type(e).__name__, e,
+        )
+
+
+def _synth_with_deadline(fn, text: str):
+    """Run a synthesis callable with a deadline. Raises TimeoutError on wedge.
+
+    Python cannot kill a running thread, so a timed-out synthesis leaves its
+    worker thread behind. That is deliberate and is the lesser evil: the
+    alternative is a daemon that never produces audio again. The abandoned
+    thread does not hold _playback_lock (the CALLER does), so the daemon
+    stays responsive for the next request — and the degradation flag makes
+    the condition loud rather than silent.
+    """
+    global _engine_degraded
+    deadline = _synth_deadline_for(text)
+    box: dict[str, Any] = {}
+    done = threading.Event()
+
+    def _run() -> None:
+        try:
+            box["value"] = fn()
+        except BaseException as e:  # noqa: BLE001 - reported to the caller
+            box["error"] = e
+        finally:
+            done.set()
+
+    worker = threading.Thread(target=_run, name="tts-synth", daemon=True)
+    worker.start()
+    if not done.wait(deadline):
+        _engine_degraded = True
+        logging.error(
+            "SYNTHESIS WEDGED: no result after %.1fs for %d chars — "
+            "abandoning this chunk (engine marked degraded)",
+            deadline, len(text),
+        )
+        raise TimeoutError(f"synthesis exceeded {deadline:.0f}s")
+    if "error" in box:
+        raise box["error"]
+    return box["value"]
 
 
 # ---------------------------------------------------------------------------
@@ -504,7 +709,6 @@ def handle_speak(text: str, from_word: int = 0) -> dict[str, str]:
     # join timed out mid-synth) see a mismatch and write no further
     # highlight state — see _write_highlight_state_guarded.
     my_generation = _speak_generation
-
     def superseded() -> bool:
         """True once a newer speak request took over (it bumped the generation).
 
@@ -564,17 +768,18 @@ def handle_speak(text: str, from_word: int = 0) -> dict[str, str]:
     t_start = time.time()
     t_first_audio: float | None = None
 
-    import winsound
-    import tempfile
-    import shutil
-
     def synth_chunk(chunk_text: str) -> tuple[bytes, int, int]:
         # Rebuild syn_config per chunk so on-the-fly speed changes
-        # (Ctrl+Alt+[/Ctrl+Alt+]/Ctrl+Alt+\) take effect on the next
-        # chunk, not only on the next speak request.
-        cfg = load_config()
+        # (Ctrl+*= / Ctrl+- / Ctrl+0) take effect on the next chunk, not only
+        # on the next speak request. _cached_config keeps this off the disk
+        # hot path (it used to re-read config.json once per chunk).
+        cfg = _cached_config()
         syn_cfg = _build_syn_config(cfg)
-        return _synthesize_to_wav_bytes(voice, chunk_text, syn_cfg, sentence_silence)
+        # Watchdog: a wedged synth must not hold _playback_lock forever.
+        return _synth_with_deadline(
+            lambda: _synthesize_to_wav_bytes(voice, chunk_text, syn_cfg, sentence_silence),
+            chunk_text,
+        )
 
     # Pipelined synthesis + playback.
     #
@@ -627,7 +832,22 @@ def handle_speak(text: str, from_word: int = 0) -> dict[str, str]:
             if ci in pending_events:
                 pending_events[ci].set()
 
-    with _playback_lock:
+    # Bounded lock acquisition. With the synthesis watchdog above, a wedged
+    # synthesis can no longer hold this lock indefinitely — but a wedged
+    # PlaySound or a killed worker mid-`finally` still could. An unbounded
+    # acquire would then block the NEW read forever and the user would press
+    # Home into total silence with no diagnostic. 60s is far beyond any
+    # legitimate chunk (the longest chunk is ~600 chars ≈ a few seconds of
+    # audio) so a timeout here means something is genuinely stuck; we log it
+    # loudly and still proceed, because serving the user beats locking up.
+    acquired = _playback_lock.acquire(timeout=60.0)
+    if not acquired:
+        logging.error(
+            "Playback lock not acquired within 60s — a previous read is "
+            "wedged. Proceeding anyway so this read is not lost; the "
+            "superseded worker's output is discarded by the generation guard."
+        )
+    try:
         playback_temp_dir = Path(tempfile.mkdtemp(prefix="playback-", dir=TMP_DIR))
         try:
             for ci, chunk in enumerate(chunks):
@@ -721,11 +941,16 @@ def handle_speak(text: str, from_word: int = 0) -> dict[str, str]:
                     except OSError:
                         pass
 
-                winsound.PlaySound(str(chunk_path), winsound.SND_FILENAME | winsound.SND_ASYNC)
+                try:
+                    winsound.PlaySound(str(chunk_path), winsound.SND_FILENAME | winsound.SND_ASYNC)
+                except Exception as e:  # noqa: BLE001
+                    # A dead/absent audio endpoint must not abort the read and
+                    # leak this read's temp dir. Record it and keep the
+                    # pipeline moving so a later chunk can still play.
+                    logging.error("PlaySound failed for chunk %d: %s", ci, e)
                 if t_first_audio is None:
                     t_first_audio = time.time()
                     logging.info("First audio after %.3fs (synth of chunk 0)", t_first_audio - t_start)
-
                 # Poll for stop or chunk completion. The buffer must account
                 # for audio device startup latency (WASAPI IAudioClient::Initialize
                 # can take ~500ms on Realtek/Intel hardware — see Microsoft Q&A
@@ -765,7 +990,7 @@ def handle_speak(text: str, from_word: int = 0) -> dict[str, str]:
                         _write_highlight_state_guarded({"state": "playing", "ms": round(elapsed_ms, 1)}, my_generation)
                     time.sleep(0.03)
                 if _stop_requested:
-                    winsound.PlaySound(None, 0)
+                    _safe_playsound_cancel()
                 if superseded():
                     # A newer speak took over while this chunk played —
                     # the takeover already cancelled audio; drop this
@@ -778,7 +1003,11 @@ def handle_speak(text: str, from_word: int = 0) -> dict[str, str]:
                     time.sleep(inter_chunk_pause)
                     chunk_offset_ms += inter_chunk_pause * 1000.0
         finally:
-            winsound.PlaySound(None, 0)
+            # Cancel is best-effort: on a device change it can raise, and an
+            # unhandled raise in this finally would skip the temp-dir cleanup
+            # below and leak it (the exact mechanism that left six dirs on
+            # disk in the installed copy).
+            _safe_playsound_cancel()
             shutil.rmtree(playback_temp_dir, ignore_errors=True)
 
         if t_first_audio is None:
@@ -802,6 +1031,12 @@ def handle_speak(text: str, from_word: int = 0) -> dict[str, str]:
                 _speak_generation,
             )
 
+    finally:
+        # Release the playback lock (acquired with a timeout above, not via
+        # a `with` block). Guarded so a path that never acquired still exits
+        # cleanly instead of raising RuntimeError from an unbalanced release.
+        if acquired:
+            _playback_lock.release()
     return {"status": "ok", "message": "Text spoken"}
 
 
@@ -831,6 +1066,7 @@ def handle_set_voice(voice_id: str) -> dict[str, str]:
     config = load_config()
     config["current_voice"] = voice_id
     save_config(config)
+    _invalidate_config_cache()
     logging.info("Voice set to %s", voice_id)
     return {"status": "ok", "message": f"Voice set to {voice_id}"}
 
@@ -864,6 +1100,10 @@ def handle_set_speed(speed: float) -> dict[str, str]:
         }
     config["length_scale"] = speed
     save_config(config)
+    # Drop the TTL cache so the new speed is visible to the very next chunk
+    # (the cache exists to keep the per-chunk read off disk, not to delay a
+    # user-visible change).
+    _invalidate_config_cache()
     logging.info("Speed set to %.2f", speed)
     # Return a human-friendly multiplier (1.0 = normal, 0.5 = 2x fast, 2.0 = 2x slow)
     if speed < 1.0:
@@ -948,6 +1188,12 @@ def serve() -> int:
         return 0
 
     logging.info("speak_server starting")
+
+    # Reclaim disk from runs that ended uncleanly (crash / taskkill / shutdown
+    # mid-read skipped the playback dir's finally). Age-gated, so a live read
+    # is never disturbed. Also bound the AHK debug log the same way users'
+    # temp dirs grow: see DebugLog rotation in the tray script.
+    _sweep_stale_playback_dirs()
 
     # Pre-load the current voice so the first request is fast. If it fails
     # (voice not in config, or its model files missing — e.g. a config
@@ -1050,12 +1296,24 @@ def serve() -> int:
         # playback thread is alive at any time — no overlapping voices.
         if _speak_thread and _speak_thread.is_alive():
             _stop_requested = True
-            try:
-                import winsound as _ws
-                _ws.PlaySound(None, 0)  # Cancel in-flight audio immediately.
-            except Exception:
-                pass
+            _safe_playsound_cancel()  # Cancel in-flight audio immediately.
             _speak_thread.join(timeout=3.0)
+            # If that join timed out, the old worker is still alive. It may be
+            # wedged in a synthesis call or in PlaySound — and because it holds
+            # _playback_lock, the worker we are about to start would block on
+            # that lock and the user would hear NOTHING while believing they
+            # had started a new read. Give it a second, longer grace; if it is
+            # still stuck, say so in the log rather than failing silently.
+            # (The synthesis watchdog bounds the common wedge; this covers the
+            # rest.)
+            if _speak_thread.is_alive():
+                _speak_thread.join(timeout=7.0)
+            if _speak_thread.is_alive():
+                logging.error(
+                    "Previous speak worker did not exit after 10s — it is "
+                    "wedged. Starting the new read anyway; the stuck worker's "
+                    "output is discarded by the generation guard."
+                )
         # Bump the generation AFTER the takeover: this request's worker
         # owns the highlight state from here on; the previous worker's
         # late writes are dropped by the generation guard (a timed-out

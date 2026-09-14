@@ -29,13 +29,32 @@ jobs:
         run: powershell -NoProfile -ExecutionPolicy Bypass -File .\scripts\sanitize-check.ps1
 
       - name: Run unit tests
-        run: python -m pytest src/test_speak.py src/test_speak_server.py src/test_overlay_server.py -v
+        run: python -m pytest src/test_speak.py src/test_speak_server.py src/test_overlay_server.py src/test_word_timings.py -v
 
       - name: Python syntax check
         run: |
           python -m py_compile src/speak.py
           python -m py_compile src/speak_server.py
           python -m py_compile src/overlay_server.py
+          python -m py_compile src/word_timings.py
+
+      # A syntax error in the tray script is a TOTAL OUTAGE: AutoHotkey shows a
+      # modal error dialog and every hotkey dies until it is dismissed. This has
+      # happened twice in live use.
+      #
+      # The interpreter is INSTALLED rather than tolerated-as-missing: a gate
+      # that silently skips on the runner is a dormant check, and a dormant
+      # check is worse than no check because it reads as coverage. If the
+      # install ever fails, the step fails loudly and the gate gets fixed.
+      - name: Install AutoHotkey v2
+        shell: pwsh
+        run: choco install autohotkey --version=2.0.19 -y --no-progress
+
+      # /validate parses the script WITHOUT executing it — no hotkeys are
+      # registered and no daemon is spawned — and the gate locates the
+      # interpreter itself, so no interpreter path lives in this file.
+      - name: AutoHotkey syntax gate
+        run: python src/check_ahk_syntax.py
 
       - name: Smoke test
         shell: pwsh

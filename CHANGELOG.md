@@ -1,5 +1,71 @@
 # Changelog
 
+## Unreleased — Stability hardening (long sessions, long text)
+
+Fixes for stalls, leaks, and silent failures found by an adversarial
+long-session / long-document audit. The headline defect: a single hung
+synthesis call could permanently silence the daemon until it was restarted.
+
+#### Fixed
+- **A hung synthesis could brick every later read (critical).** Synthesis holds
+  the playback lock for the whole read, and chunk 0 is synthesized while
+  holding it. Neither Piper nor ONNX Runtime offers a timeout, and the
+  phonemizer runs through an embedded espeak-ng — a component with documented
+  indefinite hangs. One such hang held the lock forever, and because a
+  takeover's `join(3)` gives up and leaves the wedged worker alive, every later
+  read blocked behind it and produced no audio, with no visible error. Synthesis
+  now runs under a length-aware watchdog; a wedge is abandoned, logged loudly,
+  and the daemon stays usable.
+- **Unbounded lock acquisition.** Even after a wedge was abandoned, the
+  playback lock was acquired with no timeout, so a stuck predecessor blocked
+  the next read indefinitely. Acquisition is now bounded (60s) and logs when it
+  trips.
+- **Unbounded takeover join.** A takeover waited 3s for the previous worker and
+  then started the new read regardless — leaving the wedged worker holding the
+  lock. It now grants a second, longer grace period and reports the wedge
+  instead of failing silently.
+- **`winsound` failures aborted the read and leaked its temp dir.** Per
+  CPython docs `PlaySound` raises `RuntimeError` when the system reports an
+  error — which is what a Bluetooth/USB audio-endpoint change looks like. An
+  unhandled raise on the playback thread skipped the temp-dir cleanup. Play and
+  cancel are now individually armoured and log the failure.
+- **The keep-alive heartbeat exercised nothing.** It synthesized a single
+  space, which phonemizes to a boundary-only sequence and yields **zero audio
+  bytes** — so the 5s warm-up never touched the model, and a wedged session
+  would have looked perfectly healthy. It now synthesizes a real word, asserts
+  a nonzero result, and skips while a read is in progress (removing a
+  concurrent-phonemization hazard against the same espeak-ng instance).
+- **Leaked temp dirs from unclean shutdowns.** A `playback-*` directory is
+  removed in a `finally`, which a crash, `taskkill`, or shutdown mid-read
+  skips. Six such dirs (7 MB), dated months earlier, were still on disk in a
+  live install. Startup now sweeps them, age-gated so a read in progress is
+  never touched.
+- **`config.json` was re-read from disk once per chunk.** It is a shared
+  read/write file also touched by speed and voice changes. Reads are now served
+  from a short-TTL cache that every write invalidates, so a speed change is
+  still visible to the next chunk.
+
+#### Changed
+- **`JsonEscape` no longer rebuilds the string per control character.** The
+  old per-character loop copied the entire selection once per control character
+  found, making a Home press cost O(n × k) on PDF-style text. It is now a
+  single `RegExReplace` pass: ~18× faster on a 30k selection (5.4 ms → 0.3 ms)
+  and, more importantly, correct by construction — an intermediate strided
+  rewrite MISSED a control character whenever the length was an exact multiple
+  of the stride, which would have shipped as a silent no-read (invalid JSON,
+  rejected request, no audio, no error). Verified against the old algorithm
+  with an exhaustive control-code × offset grid.
+
+#### Added
+- **AutoHotkey syntax gate.** A syntax error in the tray script is a total
+  outage — AHK shows a modal dialog and every hotkey dies until it is dismissed.
+  `src/check_ahk_syntax.py` parses the script with `/validate` (without
+  executing it, so no hotkeys register and no daemon spawns) and runs in CI and
+  in the test suite. This failure has reached live use twice.
+- **Stability regression tests** covering the synthesis watchdog, the heartbeat
+  probe, the audio-failure armour, the temp-dir sweep, the config cache, and
+  the tray script's parseability.
+
 ## Unreleased (0.9.0) — Reading panel + web overlay
 
 ### Desktop reading panel

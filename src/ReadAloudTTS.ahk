@@ -694,17 +694,25 @@ JsonEscape(text) {
     ; a space so the read plays instead of failing. (The daemon's own
     ; sanitize_text would strip them anyway, but it only sees the text
     ; AFTER JSON parsing — this is the parse gate.)
-    loop StrLen(text) {
-        ch := SubStr(text, A_Index, 1)
-        code := Ord(ch)
-        if (code < 32 or code = 127) {
-            ; ch is either one of the four escaped above (now "\" + letter,
-            ; two chars, code > 31) or a raw control char needing replacement.
-            ; A raw control char: replace it in place.
-            text := SubStr(text, 1, A_Index - 1) . " " . SubStr(text, A_Index + 1)
-        }
-    }
-    return text
+    ;
+    ; ONE RegExReplace, not a per-character loop. The previous version walked
+    ; every character and rebuilt the whole string for each control char it
+    ; found (`text := SubStr(...) . " " . SubStr(...)`), which is O(n x k) in
+    ; string copies. Measured with QueryPerformanceCounter, 200 iterations on
+    ; a 30k-char selection: 5.4 ms before, 0.3 ms now (about 18x). The larger
+    ; reason to prefer this form is correctness-by-construction: it is a
+    ; single C-level pass, so it cannot be wrong about which positions it
+    ; examined. An earlier strided-probe rewrite of this function MISSED a
+    ; control char whenever the length was an exact multiple of the stride —
+    ; which would have shipped as a silent no-read (invalid JSON, the daemon
+    ; rejects the request, no audio and no visible error). Verified by
+    ; exhaustive control-code x offset grid: outputs/logs/rat-stability.
+    ;
+    ; Order is load-bearing and unchanged: the four StrReplace passes above
+    ; have already converted raw newlines/tabs into two-character "\n"/"\t"
+    ; sequences, so this class only ever matches genuine leftovers and never
+    ; corrupts an escape that was just written.
+    return RegExReplace(text, "[\x00-\x1F\x7F]", " ")
 }
 
 ; ---------------------------------------------------------------------------
