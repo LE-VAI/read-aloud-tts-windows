@@ -8,7 +8,7 @@
 <p align="center">
   <picture>
     <source media="(prefers-reduced-motion: reduce)" srcset="docs/assets/hero-poster.png">
-    <img src="docs/assets/hero-loop.webp" width="800" alt="An app window holds a selected passage beside two keys, Home to read and F6 to stop. Below it, a reading panel shows the passage with one word in amber, and the amber moves word by word as the text is spoken while a level meter pulses. F6 is pressed mid-sentence and the panel disappears, leaving the selection in place. Home is pressed, the panel returns, and the reading starts again from the first word.">
+    <img src="docs/assets/hero-loop.webp" width="800" alt="An app window holds a selected passage beside two keys, Home to read and F6 to stop. Below it, a reading panel shows the passage with one word in yellow, and the yellow moves word by word as the text is spoken while a level meter pulses. F6 is pressed mid-sentence and the panel disappears, leaving the selection in place. Home is pressed, the panel returns, and the reading starts again from the first word.">
   </picture>
 </p>
 <p align="center"><sub>A 5-second loop. It plays once and rests, and shows a still frame if you prefer reduced motion. <a href="https://le-vai.github.io/LE-VAI/loops/#read-aloud-tts-windows">Watch it on repeat</a>.</sub></p>
